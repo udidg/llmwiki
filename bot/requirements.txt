@@ -5,3 +5,4 @@ rank-bm25
 python-dotenv
 rich
 PyYAML
+google-genai>=1.0

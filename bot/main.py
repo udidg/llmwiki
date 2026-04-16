@@ -1,7 +1,7 @@
 """
 LLM Wiki — Telegram Bot
 =======================
-Personal knowledge base powered by Ollama (gemma4:e4b).
+Personal knowledge base powered by Google Gemini API.
 Implements the Karpathy LLM Wiki pattern via Telegram.
 
 Commands (all optional — natural language works too):
@@ -48,7 +48,7 @@ from telegram.ext import (
 )
 
 from fetcher import FetchResult, fetch_url, web_search
-from ollama import OllamaClient
+from gemini import GeminiClient
 from search import WikiSearch
 from wiki import WikiManager, now_slug, slugify
 
@@ -70,13 +70,13 @@ ALLOWED_USERS: set[int] = {
     for uid in os.getenv("TELEGRAM_ALLOWED_USERS", "").split(",")
     if uid.strip()
 }
-OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
+GEMINI_API_KEY: str = os.environ["GEMINI_API_KEY"]
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
 DATA_DIR: str = os.getenv("DATA_DIR", "./data")
 
 # ── Globals (initialized in main) ─────────────────────────────────────────────
 
-ollama: OllamaClient
+llm: GeminiClient
 wiki: WikiManager
 wiki_search: WikiSearch
 
@@ -137,7 +137,7 @@ async def do_ingest(
             f"⏳ *Ingesting* `{filename}`\n"
             f"📊 Source: {source_type} • {word_count} words\n\n"
             f"✅ Step 1/4: Context assembled\n"
-            f"🔄 Step 2/4: Sending to Ollama (`{OLLAMA_MODEL}`)…\n"
+            f"🔄 Step 2/4: Sending to Gemini (`{GEMINI_MODEL}`)…\n"
             f"_LLM is reading the source and deciding what wiki pages to create/update_",
         )
 
@@ -154,7 +154,7 @@ async def do_ingest(
             f"⏳ *Ingesting* `{filename}`\n"
             f"📊 Source: {source_type} • {word_count} words\n\n"
             f"✅ Step 1/4: Context assembled\n"
-            f"✅ Step 2/4: Ollama processed\n"
+            f"✅ Step 2/4: Gemini processed\n"
             f"✅ Step 3/4: Files written\n"
             f"🔄 Step 4/4: Rebuilding search index…",
         )
@@ -182,7 +182,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return await deny(update)
     await update.message.reply_text(
         "👋 *LLM Wiki Bot*\n\n"
-        "Your personal knowledge base, powered by Ollama.\n\n"
+        "Your personal knowledge base, powered by Google Gemini.\n\n"
         "*Send me:*\n"
         "• A text message → journal entry\n"
         "• A URL → fetched and ingested\n"
@@ -253,7 +253,7 @@ async def cmd_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             status_msg,
             f"🔍 *Query:* _{question}_\n\n"
             f"✅ Step 1/3: Keywords extracted\n"
-            f"🔄 Step 2/3: Loading relevant pages → asking Ollama (`{OLLAMA_MODEL}`)…\n"
+            f"🔄 Step 2/3: Loading relevant pages → asking Gemini (`{GEMINI_MODEL}`)…\n"
             f"_LLM is reading your wiki and composing an answer_",
         )
 
@@ -420,7 +420,7 @@ async def cmd_lint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             status_msg,
             f"🔍 *Wiki Health Check*\n\n"
             f"✅ Step 1/2: Loaded {page_count} page(s)\n"
-            f"🔄 Step 2/2: Asking Ollama (`{OLLAMA_MODEL}`) to analyze…\n"
+            f"🔄 Step 2/2: Asking Gemini (`{GEMINI_MODEL}`) to analyze…\n"
             f"_LLM is checking for contradictions, orphans, missing concepts, stale content_",
         )
 
@@ -474,13 +474,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not is_allowed(update):
         return await deny(update)
 
-    result = wiki.get_status(OLLAMA_MODEL)
+    result = wiki.get_status(GEMINI_MODEL)
     log_lines = "\n".join(f"  `{e}`" for e in result.last_log_entries) or "  (empty)"
 
     reply = (
         f"📊 *Wiki Status*\n\n"
         f"*Model:* `{result.model}`\n"
-        f"*Ollama:* `{OLLAMA_BASE_URL}`\n"
+        f"*API:* Google Gemini\n"
         f"*Total pages:* {result.total_pages}\n"
         f"  • Sources: {result.sources}\n"
         f"  • People: {result.people}\n"
@@ -617,7 +617,7 @@ def _classify_intent_llm(text: str) -> str:
         "Reply with ONLY one word: query, websearch, or journal. No explanation."
     )
     messages = [{"role": "user", "content": text}]
-    response = ollama.chat(system, messages).strip().lower()
+    response = llm.chat(system, messages).strip().lower()
     logger.info("  ← LLM classified intent as: %r", response)
     if response in ("query", "websearch", "journal"):
         return response
@@ -707,7 +707,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # ── 3. LLM classification for ambiguous messages ──────────────────────
         thinking = await update.message.reply_text(
             f"🧠 *Classifying intent…*\n"
-            f"_Message is ambiguous — asking Ollama (`{OLLAMA_MODEL}`) to classify_\n\n"
+            f"_Message is ambiguous — asking Gemini (`{GEMINI_MODEL}`) to classify_\n\n"
             f"🔄 Sending to LLM intent classifier…",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -722,7 +722,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _update_status(
             thinking,
             f"🧠 *Intent:* {emoji} {label}\n"
-            f"_Classified by Ollama LLM (message was ambiguous for regex)_",
+            f"_Classified by Gemini LLM (message was ambiguous for regex)_",
         )
         await asyncio.sleep(1.5)
         try:
@@ -747,7 +747,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 status_msg,
                 f"🔍 *Query:* _{text[:80]}_\n\n"
                 f"✅ Step 1/3: Keywords extracted\n"
-                f"🔄 Step 2/3: Loading pages → asking Ollama (`{OLLAMA_MODEL}`)…\n"
+                f"🔄 Step 2/3: Loading pages → asking Gemini (`{GEMINI_MODEL}`)…\n"
                 f"_LLM is reading your wiki and composing an answer_",
             )
 
@@ -864,22 +864,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def post_init(application: Application) -> None:
-    """Called after the bot is initialized — pull model if needed."""
-    logger.info("Waiting for Ollama…")
-    ollama.wait_until_ready()
-
-    if not ollama.model_is_pulled():
-        logger.info("Model %s not found locally — pulling…", OLLAMA_MODEL)
-
-        def _pull_progress(status: str) -> None:
-            logger.info("Pull: %s", status)
-
-        await asyncio.get_event_loop().run_in_executor(
-            None, lambda: ollama.pull_model(_pull_progress)
-        )
-        logger.info("Model pull complete.")
-    else:
-        logger.info("Model %s already available.", OLLAMA_MODEL)
+    """Called after the bot is initialized — verify Gemini API access."""
+    logger.info("Checking Gemini API…")
+    llm.wait_until_ready()
+    logger.info("Gemini API ready — model=%s", GEMINI_MODEL)
 
     wiki_search.rebuild_index()
     logger.info("Bot ready.")
@@ -889,10 +877,10 @@ async def post_init(application: Application) -> None:
 
 
 def main() -> None:
-    global ollama, wiki, wiki_search
+    global llm, wiki, wiki_search
 
-    ollama = OllamaClient(base_url=OLLAMA_BASE_URL, model=OLLAMA_MODEL)
-    wiki = WikiManager(data_dir=DATA_DIR, ollama=ollama)
+    llm = GeminiClient(api_key=GEMINI_API_KEY, model=GEMINI_MODEL)
+    wiki = WikiManager(data_dir=DATA_DIR, llm=llm)
     wiki_search = WikiSearch(wiki_dir=str(Path(DATA_DIR) / "wiki"))
 
     app = (

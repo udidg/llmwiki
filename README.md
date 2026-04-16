@@ -1,10 +1,10 @@
-# LLM Wiki — Personal Knowledge Base via Telegram + Ollama
+# LLM Wiki — Personal Knowledge Base via Telegram + Google Gemini
 
 > Implements the [Karpathy LLM Wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f):
 > a persistent, compounding knowledge base where the LLM incrementally builds and maintains
 > structured markdown pages — not a RAG chatbot that re-derives answers from scratch every time.
 
-**Stack:** Telegram bot · Ollama (`gemma4:e4b`) · Docker Compose · BM25 search · Markdown wiki
+**Stack:** Telegram bot · Google Gemini API · Docker Compose · BM25 search · Markdown wiki
 
 ---
 
@@ -21,13 +21,13 @@ bot/wiki.py          ← assembles context:
                         AGENTS.md + wiki/index.md + relevant pages
     │
     ▼
-gemma4:e4b (Ollama)  ← reads context, produces answer + file writes
+Gemini API           ← reads context, produces answer + file writes
     │
     ▼
 bot/wiki.py          ← executes file writes (wiki pages, index, log)
     │
     ▼
-You (Telegram)       ← receives streamed answer
+You (Telegram)       ← receives answer
 ```
 
 The wiki is the LLM's **persistent memory**. Every journal entry, article, and podcast note
@@ -42,6 +42,7 @@ you send gets compiled into structured markdown pages that grow richer over time
 - [Docker](https://docs.docker.com/get-docker/) + Docker Compose
 - A Telegram bot token (from [@BotFather](https://t.me/BotFather))
 - Your Telegram user ID (from [@userinfobot](https://t.me/userinfobot))
+- A Google Gemini API key (from [AI Studio](https://aistudio.google.com/apikey))
 
 ### 2. Clone and configure
 
@@ -56,7 +57,8 @@ Edit `.env`:
 ```env
 TELEGRAM_TOKEN=your_bot_token_here
 TELEGRAM_ALLOWED_USERS=123456789
-OLLAMA_MODEL=gemma4:e4b
+GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_MODEL=gemini-3.1-flash-lite-preview
 ```
 
 ### 3. Start
@@ -65,8 +67,7 @@ OLLAMA_MODEL=gemma4:e4b
 docker compose up -d
 ```
 
-On first run, the bot will automatically pull `gemma4:e4b` from Ollama (~3–5 GB).
-This takes a few minutes. Check progress with:
+Check logs:
 
 ```bash
 docker compose logs -f bot
@@ -121,7 +122,7 @@ Just send a message. The bot classifies your intent automatically:
 
 ```
 llm-wiki/
-├── docker-compose.yml       ← two services: ollama + bot
+├── docker-compose.yml       ← bot service
 ├── .env.example             ← copy to .env and fill in
 ├── README.md
 ├── .github/
@@ -132,7 +133,7 @@ llm-wiki/
 │   ├── requirements.txt
 │   ├── main.py              ← Telegram bot handlers + intent classifier
 │   ├── wiki.py              ← WikiManager: ingest / query / lint
-│   ├── ollama.py            ← Ollama HTTP API wrapper
+│   ├── gemini.py            ← Google Gemini API wrapper
 │   ├── fetcher.py           ← URL fetch + DuckDuckGo web search
 │   └── search.py            ← BM25 search over wiki pages
 └── data/                    ← mounted as Docker volume
@@ -228,7 +229,7 @@ The wiki lives in `data/wiki/` as plain markdown files. You can:
 ## AGENTS.md — the schema file
 
 `data/AGENTS.md` is the most important file. It is loaded as the system prompt on every
-Ollama call and tells the LLM exactly how to behave as a wiki maintainer:
+Gemini API call and tells the LLM exactly how to behave as a wiki maintainer:
 
 - Page formats (source summaries, person pages, concept pages, insight pages)
 - Ingest workflow (what to create, what to update, what JSON to return)
@@ -239,29 +240,12 @@ You can edit `AGENTS.md` to customize the wiki for your domain. The LLM will ada
 
 ---
 
-## GPU support
-
-If you have an NVIDIA GPU, uncomment the `deploy` section in `docker-compose.yml`:
-
-```yaml
-ollama:
-  deploy:
-    resources:
-      reservations:
-        devices:
-          - driver: nvidia
-            count: 1
-            capabilities: [gpu]
-```
-
----
-
 ## Changing the model
 
 Edit `.env`:
 
 ```env
-OLLAMA_MODEL=llama3.1:8b
+GEMINI_MODEL=gemini-2.5-flash
 ```
 
 Then restart:
@@ -270,7 +254,7 @@ Then restart:
 docker compose restart bot
 ```
 
-The bot will pull the new model automatically on startup.
+See available models at https://ai.google.dev/gemini-api/docs/models
 
 ---
 
@@ -282,7 +266,6 @@ docker compose up -d
 
 # View logs
 docker compose logs -f bot
-docker compose logs -f ollama
 
 # Stop
 docker compose down
@@ -302,7 +285,6 @@ All data is stored in Docker named volumes:
 
 | Volume | Contents |
 |---|---|
-| `ollama_models` | Downloaded Ollama models (~3–8 GB) |
 | `wiki_data` | Your wiki and raw sources |
 
 To back up your wiki:

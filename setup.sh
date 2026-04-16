@@ -25,13 +25,15 @@ else
 
   read -rp "  Telegram bot token : " TELEGRAM_TOKEN
   read -rp "  Your Telegram user ID : " TELEGRAM_ALLOWED_USERS
-  read -rp "  Ollama model [gemma4:e4b] : " OLLAMA_MODEL
-  OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:e4b}"
+  read -rp "  Gemini API key (https://aistudio.google.com/apikey) : " GEMINI_API_KEY
+  read -rp "  Gemini model [gemini-3.1-flash-lite-preview] : " GEMINI_MODEL
+  GEMINI_MODEL="${GEMINI_MODEL:-gemini-3.1-flash-lite-preview}"
 
   cat > .env <<EOF
 TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
 TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS}
-OLLAMA_MODEL=${OLLAMA_MODEL}
+GEMINI_API_KEY=${GEMINI_API_KEY}
+GEMINI_MODEL=${GEMINI_MODEL}
 EOF
   echo "✅  .env saved"
 fi
@@ -41,14 +43,6 @@ echo ""
 echo "🐳  Pulling images and starting stack …"
 docker compose pull
 docker compose up -d
-
-# ── Pull the Ollama model ─────────────────────────────────────────────────────
-OLLAMA_MODEL_VAL=$(grep OLLAMA_MODEL .env | cut -d= -f2)
-OLLAMA_MODEL_VAL="${OLLAMA_MODEL_VAL:-gemma4:e4b}"
-
-echo ""
-echo "🧠  Pulling Ollama model: $OLLAMA_MODEL_VAL  (this may take a few minutes) …"
-docker compose exec ollama ollama pull "$OLLAMA_MODEL_VAL"
 
 echo ""
 echo "🎉  Done! Open Telegram, find your bot, and send /start"

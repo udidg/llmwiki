@@ -1,7 +1,7 @@
 """
 WikiManager — core wiki operations: ingest, query, lint, status.
 
-The LLM (via OllamaClient) is the agent. This module is its "hands":
+The LLM (via GeminiClient) is the agent. This module is its "hands":
 it assembles context, calls the LLM, then executes the file writes
 the LLM decides on.
 """
@@ -16,7 +16,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from ollama import OllamaClient, extract_json, parse_file_blocks
+from gemini import GeminiClient, extract_json, parse_file_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -100,11 +100,11 @@ class WikiManager:
         insights/
     """
 
-    def __init__(self, data_dir: str, ollama: OllamaClient) -> None:
+    def __init__(self, data_dir: str, llm: GeminiClient) -> None:
         self.data = Path(data_dir)
         self.raw = self.data / "raw"
         self.wiki = self.data / "wiki"
-        self.ollama = ollama
+        self.llm = llm
         self._ensure_dirs()
 
     # ── Setup ─────────────────────────────────────────────────────────────────
@@ -305,9 +305,9 @@ class WikiManager:
 
         messages = [{"role": "user", "content": user_msg}]
 
-        logger.info("  → sending ingest prompt to Ollama …")
-        response = self.ollama.chat(system, messages)
-        logger.info("  ← Ollama response received (%d chars)", len(response))
+        logger.info("  → sending ingest prompt to Gemini …")
+        response = self.llm.chat(system, messages)
+        logger.info("  ← Gemini response received (%d chars)", len(response))
 
         # Execute file writes
         logger.info("  executing file writes from LLM response …")
@@ -376,13 +376,13 @@ class WikiManager:
 
         total_prompt_chars = len(system) + len(user_msg)
         logger.info(
-            "  → sending query prompt to Ollama  total_prompt=%d chars (~%d tokens) …",
+            "  → sending query prompt to Gemini  total_prompt=%d chars (~%d tokens) …",
             total_prompt_chars, total_prompt_chars // 4,
         )
 
         messages = [{"role": "user", "content": user_msg}]
-        response = self.ollama.chat(system, messages)
-        logger.info("  ← Ollama response received (%d chars)", len(response))
+        response = self.llm.chat(system, messages)
+        logger.info("  ← Gemini response received (%d chars)", len(response))
 
         # If LLM also wrote any insight pages, execute them
         logger.info("  checking for any FILE: blocks in query response …")
@@ -427,10 +427,10 @@ class WikiManager:
             f"Return the JSON lint report."
         )
 
-        logger.info("  → sending lint prompt to Ollama …")
+        logger.info("  → sending lint prompt to Gemini …")
         messages = [{"role": "user", "content": user_msg}]
-        response = self.ollama.chat(system, messages)
-        logger.info("  ← Ollama response received (%d chars)", len(response))
+        response = self.llm.chat(system, messages)
+        logger.info("  ← Gemini response received (%d chars)", len(response))
 
         logger.info("  parsing JSON lint report …")
         data = extract_json(response) or {}
