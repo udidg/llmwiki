@@ -235,6 +235,14 @@ class WikiManager:
         Parse FILE: blocks from LLM response and write them to disk.
         Returns (created_paths, updated_paths).
         """
+        logger.info("  _execute_file_writes: response length = %d chars", len(llm_response))
+        logger.info(
+            "  _execute_file_writes: 'FILE:' appears %d time(s), 'END_FILE' appears %d time(s), "
+            "code fences: %d",
+            llm_response.count("FILE:"), llm_response.count("END_FILE"),
+            llm_response.count("```"),
+        )
+
         file_blocks = parse_file_blocks(llm_response)
         created: list[str] = []
         updated: list[str] = []

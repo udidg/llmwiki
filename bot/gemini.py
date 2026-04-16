@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -22,18 +23,14 @@ FILE_BLOCK_START = "FILE:"
 FILE_BLOCK_SEP = "---"
 FILE_BLOCK_END = "END_FILE"
 
+# Regex to strip ALL code fence markers (``` lines) from text.
+_CODE_FENCE_LINE_RE = re.compile(r"^\s*```[^\n]*$", re.MULTILINE)
 
-def parse_file_blocks(text: str) -> dict[str, str]:
+
+def _parse_file_blocks_raw(text: str) -> dict[str, str]:
     """
-    Parse LLM output for embedded file blocks in the format:
-
-        FILE: wiki/sources/slug.md
-        ---
-        <content>
-        ---
-        END_FILE
-
-    Returns a dict mapping path → content.
+    Core parser: scan lines for FILE:/END_FILE blocks.
+    Returns dict mapping path → content.
     """
     files: dict[str, str] = {}
     lines = text.splitlines()
@@ -41,6 +38,7 @@ def parse_file_blocks(text: str) -> dict[str, str]:
     while i < len(lines):
         line = lines[i].strip()
         if line.startswith(FILE_BLOCK_START):
+            logger.info("parse_file_blocks: found FILE: at line %d: %r", i, line)
             path = line[len(FILE_BLOCK_START):].strip()
             # skip separator
             i += 1
@@ -60,13 +58,52 @@ def parse_file_blocks(text: str) -> dict[str, str]:
             logger.debug("  parsed FILE block → %s (%d lines)", path, len(content_lines))
         else:
             i += 1
+    return files
 
+
+def parse_file_blocks(text: str) -> dict[str, str]:
+    """
+    Parse LLM output for embedded file blocks in the format:
+
+        FILE: wiki/sources/slug.md
+        ---
+        <content>
+        ---
+        END_FILE
+
+    Handles LLM responses that wrap FILE: blocks in markdown code fences
+    by stripping fence markers and retrying when the first parse finds nothing.
+
+    Returns a dict mapping path → content.
+    """
+    # First pass: try parsing as-is
+    files = _parse_file_blocks_raw(text)
     if files:
         logger.info("parse_file_blocks: found %d file block(s): %s", len(files), list(files.keys()))
-    else:
-        logger.debug("parse_file_blocks: no FILE: blocks found in response")
+        return files
 
-    return files
+    # If no blocks found but FILE: exists somewhere in the text,
+    # it's likely wrapped in code fences. Strip them and retry.
+    if "FILE:" in text and "```" in text:
+        logger.info(
+            "parse_file_blocks: no blocks found on first pass, but FILE: and ``` "
+            "detected — stripping code fences and retrying"
+        )
+        stripped = _CODE_FENCE_LINE_RE.sub("", text)
+        files = _parse_file_blocks_raw(stripped)
+        if files:
+            logger.info(
+                "parse_file_blocks: found %d file block(s) after stripping code fences: %s",
+                len(files), list(files.keys()),
+            )
+            return files
+
+    logger.warning(
+        "parse_file_blocks: no FILE: blocks found in response "
+        "(%d chars, 'FILE:' count=%d, '```' count=%d)",
+        len(text), text.count("FILE:"), text.count("```"),
+    )
+    return {}
 
 
 def extract_json(text: str) -> dict[str, Any] | None:
