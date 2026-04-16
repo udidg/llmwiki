@@ -245,7 +245,24 @@ class WikiManager:
 
         logger.info("  _execute_file_writes: processing %d file block(s)", len(file_blocks))
 
+        # Known wiki subdirectories and root files — used to auto-fix missing wiki/ prefix
+        _WIKI_SUBDIRS = ("sources/", "people/", "concepts/", "insights/")
+        _WIKI_ROOT_FILES = ("index.md", "log.md", "overview.md")
+
         for rel_path, content in file_blocks.items():
+            # Auto-fix: if LLM omitted the wiki/ prefix but path starts with
+            # a known wiki subdirectory or is a known root file, prepend it.
+            if not rel_path.startswith("wiki/") and (
+                any(rel_path.startswith(sub) for sub in _WIKI_SUBDIRS)
+                or rel_path in _WIKI_ROOT_FILES
+            ):
+                fixed = f"wiki/{rel_path}"
+                logger.info(
+                    "  🔧 auto-fix: LLM omitted wiki/ prefix: '%s' → '%s'",
+                    rel_path, fixed,
+                )
+                rel_path = fixed
+
             # Security: only allow writes inside wiki/
             if not rel_path.startswith("wiki/"):
                 logger.warning(

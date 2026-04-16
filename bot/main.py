@@ -37,10 +37,11 @@ from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import Document, Message, Update
+from telegram import Document, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -161,17 +162,72 @@ async def do_ingest(
 
         wiki_search.rebuild_index()
 
-        # Step 4: Done
+        # Step 4: Done — build inline keyboard for viewing created/updated files
+        all_paths = result.created + result.updated
+        buttons = []
+        for p in all_paths:
+            # Skip index.md and log.md — they're bookkeeping, not interesting
+            if p.endswith(("index.md", "log.md")):
+                continue
+            label = p.replace("wiki/", "", 1)  # shorter label
+            buttons.append([InlineKeyboardButton(f"📖 {label}", callback_data=f"view:{p}")])
+
+        reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+
         reply = (
             f"✅ *Ingested:* {result.title}\n\n"
             f"*Created:*\n{created_list}\n\n"
             f"*Updated:*\n{updated_list}\n\n"
             f"_{result.summary}_"
         )
-        await status_msg.edit_text(reply, parse_mode=ParseMode.MARKDOWN)
+        await status_msg.edit_text(reply, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
     except Exception as e:
         logger.exception("Ingest failed")
         await status_msg.edit_text(f"❌ Ingest failed: {e}")
+
+
+# ── Callback query handler (inline keyboard buttons) ─────────────────────────
+
+
+async def handle_view_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline keyboard button presses to view wiki page content."""
+    query = update.callback_query
+    await query.answer()  # acknowledge the button press
+
+    data = query.data or ""
+    if not data.startswith("view:"):
+        return
+
+    rel_path = data[len("view:"):]
+
+    # Security: only allow reading wiki/ files
+    if not rel_path.startswith("wiki/"):
+        await query.message.reply_text("⛔ Cannot read files outside wiki/.")
+        return
+
+    content = wiki.read_page(rel_path)
+    if not content:
+        await query.message.reply_text(f"📭 File not found: `{rel_path}`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # Send the file content, chunked if needed (Telegram 4096 char limit)
+    header = f"📖 *{rel_path}*\n\n"
+    max_chunk = 4000 - len(header)
+
+    if len(content) <= max_chunk:
+        await query.message.reply_text(
+            f"{header}```\n{content}\n```",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        # Send in chunks
+        chunks = [content[i : i + max_chunk] for i in range(0, len(content), max_chunk)]
+        for i, chunk in enumerate(chunks, 1):
+            chunk_header = f"📖 *{rel_path}* (part {i}/{len(chunks)})\n\n"
+            await query.message.reply_text(
+                f"{chunk_header}```\n{chunk}\n```",
+                parse_mode=ParseMode.MARKDOWN,
+            )
 
 
 # ── Command handlers ──────────────────────────────────────────────────────────
@@ -901,6 +957,9 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("index", cmd_index))
     app.add_handler(CommandHandler("save", cmd_save))
+
+    # Callback query handler (inline keyboard buttons)
+    app.add_handler(CallbackQueryHandler(handle_view_page, pattern=r"^view:"))
 
     # Message handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
