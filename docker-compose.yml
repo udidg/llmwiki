@@ -1,45 +1,18 @@
 services:
 
-  ollama:
-    image: ollama/ollama:latest
-    volumes:
-      - ollama_models:/root/.ollama
-    ports:
-      - "11434:11434"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || wget -qO- http://localhost:11434/api/tags"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-    # GPU support — uncomment if you have an NVIDIA GPU:
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
-
   bot:
-    # Option A (default): build locally from source
     build: ./bot
-    # Option B: pull pre-built image from GitHub Container Registry
-    # Uncomment the line below and comment out 'build: ./bot' to use GHCR:
-    # image: ghcr.io/${GITHUB_REPOSITORY:-your-username/llm-wiki}/llm-wiki-bot:latest
     env_file: .env
     environment:
-      OLLAMA_BASE_URL: http://ollama:11434
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e4b}
+      # Points to Ollama running natively on the host (not in Docker)
+      OLLAMA_BASE_URL: http://host-gateway:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma2:2b}
       DATA_DIR: /data
     volumes:
       - wiki_data:/data
-    depends_on:
-      ollama:
-        condition: service_healthy
+    extra_hosts:
+      - "host-gateway:host-gateway"
     restart: unless-stopped
 
 volumes:
-  ollama_models:
   wiki_data:
