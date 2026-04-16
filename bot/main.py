@@ -33,8 +33,11 @@ import logging
 import os
 import re
 import tempfile
+import traceback
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import AsyncIterator
 
 from dotenv import load_dotenv
 from telegram import Document, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
@@ -97,6 +100,123 @@ async def deny(update: Update) -> None:
     await update.message.reply_text("⛔ Access denied.")
 
 
+# ── Typing indicator helper ───────────────────────────────────────────────────
+
+
+@asynccontextmanager
+async def typing_indicator(chat_id: int, bot) -> AsyncIterator[None]:
+    """
+    Context manager that sends ChatAction.TYPING every 4 seconds
+    while the wrapped code is running. Telegram typing indicators
+    expire after ~5 seconds, so we re-send periodically.
+    """
+    stop = asyncio.Event()
+
+    async def _keep_typing() -> None:
+        while not stop.is_set():
+            try:
+                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            except Exception:
+                pass  # best-effort — don't crash if typing indicator fails
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=4.0)
+            except asyncio.TimeoutError:
+                pass
+
+    task = asyncio.create_task(_keep_typing())
+    try:
+        yield
+    finally:
+        stop.set()
+        await task
+
+
+# ── Error formatting helper ──────────────────────────────────────────────────
+
+
+def _format_user_error(error: Exception) -> str:
+    """
+    Convert an exception into a human-readable error message for the user.
+    Categorizes errors by type and provides actionable information.
+    """
+    error_str = str(error)
+    error_type = type(error).__name__
+
+    # Timeout errors
+    if any(kw in error_type.lower() for kw in ("timeout", "timedout")):
+        return (
+            "⏱️ *Request timed out*\n\n"
+            "The operation took too long to complete. This usually means:\n"
+            "• The LLM is overloaded — try again in a minute\n"
+            "• The content was too large to process\n\n"
+            f"_Technical: {error_type}_"
+        )
+    if "timeout" in error_str.lower():
+        return (
+            "⏱️ *Request timed out*\n\n"
+            "The server didn't respond in time. Please try again.\n\n"
+            f"_Technical: {error_type}: {error_str[:120]}_"
+        )
+
+    # Connection / network errors
+    if any(kw in error_type.lower() for kw in ("connection", "connect", "network", "dns")):
+        return (
+            "🌐 *Connection error*\n\n"
+            "Could not reach the external service. This could mean:\n"
+            "• The API service is temporarily down\n"
+            "• Network connectivity issues\n\n"
+            "Please try again in a few moments.\n\n"
+            f"_Technical: {error_type}_"
+        )
+
+    # HTTP errors
+    if "status" in error_str.lower() and any(code in error_str for code in ("401", "403")):
+        return (
+            "🔑 *Authentication error*\n\n"
+            "The API key appears to be invalid or expired. "
+            "Please check the bot configuration.\n\n"
+            f"_Technical: {error_str[:150]}_"
+        )
+    if "429" in error_str or "rate" in error_str.lower():
+        return (
+            "🚦 *Rate limit exceeded*\n\n"
+            "Too many requests to the API. Please wait a minute and try again.\n\n"
+            f"_Technical: {error_str[:150]}_"
+        )
+    if "500" in error_str or "502" in error_str or "503" in error_str:
+        return (
+            "🔧 *Service temporarily unavailable*\n\n"
+            "The external service is experiencing issues. Please try again later.\n\n"
+            f"_Technical: {error_str[:150]}_"
+        )
+
+    # Gemini-specific errors
+    if "gemini" in error_str.lower() or "google" in error_str.lower():
+        return (
+            "🤖 *Gemini API error*\n\n"
+            "The AI model encountered an issue processing your request.\n"
+            "Please try again. If the problem persists, the content may be "
+            "too large or contain unsupported formatting.\n\n"
+            f"_Technical: {error_str[:150]}_"
+        )
+
+    # JSON parsing errors (LLM returned bad output)
+    if "json" in error_type.lower() or "json" in error_str.lower():
+        return (
+            "📋 *Processing error*\n\n"
+            "The AI model returned an unexpected response format. "
+            "Please try again — this is usually a one-off issue.\n\n"
+            f"_Technical: {error_type}_"
+        )
+
+    # Generic fallback
+    return (
+        f"❌ *Something went wrong*\n\n"
+        f"An unexpected error occurred. Please try again.\n\n"
+        f"_Technical: {error_type}: {error_str[:200]}_"
+    )
+
+
 # ── Verbose status helper ─────────────────────────────────────────────────────
 
 
@@ -142,9 +262,10 @@ async def do_ingest(
             f"_LLM is reading the source and deciding what wiki pages to create/update_",
         )
 
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, wiki.ingest, content, source_type, filename
-        )
+        async with typing_indicator(message.chat_id, message.get_bot()):
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, wiki.ingest, content, source_type, filename
+            )
 
         # Step 3: File writes done
         created_list = "\n".join(f"  📄 `{p}`" for p in result.created) or "  (none)"
@@ -183,7 +304,7 @@ async def do_ingest(
         await status_msg.edit_text(reply, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
     except Exception as e:
         logger.exception("Ingest failed")
-        await status_msg.edit_text(f"❌ Ingest failed: {e}")
+        await status_msg.edit_text(_format_user_error(e), parse_mode=ParseMode.MARKDOWN)
 
 
 # ── Callback query handler (inline keyboard buttons) ─────────────────────────
@@ -313,9 +434,10 @@ async def cmd_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"_LLM is reading your wiki and composing an answer_",
         )
 
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, wiki.query, question
-        )
+        async with typing_indicator(update.message.chat_id, update.message.get_bot()):
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, wiki.query, question
+            )
 
         sources_text = ""
         if result.sources_consulted:
@@ -338,7 +460,7 @@ async def cmd_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await status_msg.edit_text(reply, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.exception("Query failed")
-        await status_msg.edit_text(f"❌ Query failed: {e}")
+        await status_msg.edit_text(_format_user_error(e), parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -390,7 +512,8 @@ async def cmd_websearch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
     try:
-        results = await web_search(query, max_results=5)
+        async with typing_indicator(update.message.chat_id, update.message.get_bot()):
+            results = await web_search(query, max_results=5)
         if not results:
             await status_msg.edit_text(
                 f"🌐 *Web search:* `{query}`\n\n"
@@ -412,7 +535,7 @@ async def cmd_websearch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await status_msg.edit_text("\n".join(lines)[:4000], parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.exception("Web search failed")
-        await status_msg.edit_text(f"❌ Web search failed: {e}")
+        await status_msg.edit_text(_format_user_error(e), parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -432,7 +555,8 @@ async def cmd_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     try:
-        fetch_result: FetchResult = await fetch_url(url)
+        async with typing_indicator(update.message.chat_id, update.message.get_bot()):
+            fetch_result: FetchResult = await fetch_url(url)
 
         await _update_status(
             status_msg,
@@ -457,7 +581,7 @@ async def cmd_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     except Exception as e:
         logger.exception("Fetch failed")
-        await status_msg.edit_text(f"❌ Fetch failed: {e}")
+        await status_msg.edit_text(_format_user_error(e), parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_lint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -480,7 +604,8 @@ async def cmd_lint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"_LLM is checking for contradictions, orphans, missing concepts, stale content_",
         )
 
-        result = await asyncio.get_event_loop().run_in_executor(None, wiki.lint)
+        async with typing_indicator(update.message.chat_id, update.message.get_bot()):
+            result = await asyncio.get_event_loop().run_in_executor(None, wiki.lint)
 
         lines = ["🔍 *Wiki Health Check*\n"]
 
@@ -523,7 +648,7 @@ async def cmd_lint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await status_msg.edit_text("\n".join(lines)[:4000], parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.exception("Lint failed")
-        await status_msg.edit_text(f"❌ Lint failed: {e}")
+        await status_msg.edit_text(_format_user_error(e), parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -595,7 +720,8 @@ async def cmd_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Save failed: {e}")
+        logger.exception("Save failed")
+        await update.message.reply_text(_format_user_error(e), parse_mode=ParseMode.MARKDOWN)
 
 
 # ── Message handlers ──────────────────────────────────────────────────────────
@@ -699,12 +825,116 @@ _INTENT_LABEL = {
 }
 
 
+def _classify_link(url: str, content: str, title: str) -> dict:
+    """
+    Use the LLM to classify a link into an action list category.
+    Returns a dict with keys: category, description, confidence.
+    category is one of: 'to_buy', 'to_review', 'to_read', 'ambiguous'
+    """
+    logger.info("  → LLM link classification for: %r (title=%r)", url[:80], title[:60])
+    system = (
+        "You are a link categorizer for a personal knowledge base. "
+        "Given a URL and its content, classify it into exactly one action list:\n"
+        "- to_buy: products, items to purchase, shopping links, wishlists, deals\n"
+        "- to_review: tools, apps, services, courses, or things to evaluate/try\n"
+        "- to_read: articles, blog posts, papers, documentation, tutorials, books\n"
+        "- ambiguous: if you genuinely cannot determine the category\n\n"
+        "Reply with ONLY a JSON object (no markdown fences):\n"
+        '{"category": "to_buy|to_review|to_read|ambiguous", '
+        '"description": "One-sentence description of the link content", '
+        '"confidence": 0.0-1.0}\n\n'
+        "Be decisive — only use 'ambiguous' if the content truly fits multiple categories equally."
+    )
+    # Send a truncated version of the content to avoid token limits
+    truncated = content[:3000] if len(content) > 3000 else content
+    user_msg = f"URL: {url}\nTitle: {title}\n\nContent (truncated):\n{truncated}"
+    messages = [{"role": "user", "content": user_msg}]
+    response = llm.chat(system, messages).strip()
+    logger.info("  ← LLM link classification response: %r", response[:200])
+
+    from gemini import extract_json as _extract_json
+    data = _extract_json(response)
+    if data and "category" in data:
+        return data
+    # Fallback
+    logger.warning("  LLM returned unexpected link classification — defaulting to ambiguous")
+    return {"category": "ambiguous", "description": title or "Link", "confidence": 0.0}
+
+
+# Per-user state: pending link categorization for inline keyboard
+_pending_links: dict[int, dict] = {}
+
+_CATEGORY_EMOJI = {
+    "to_buy": "🛒",
+    "to_review": "🔍",
+    "to_read": "📖",
+}
+
+_CATEGORY_LABEL = {
+    "to_buy": "To Buy",
+    "to_review": "To Review",
+    "to_read": "To Read",
+}
+
+
+async def handle_link_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline keyboard button presses for link categorization."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data or ""
+    if not data.startswith("linkcat:"):
+        return
+
+    category = data[len("linkcat:"):]
+    user_id = update.effective_user.id
+    pending = _pending_links.pop(user_id, None)
+
+    if not pending:
+        await query.message.reply_text("⚠️ Link data expired. Please send the link again.")
+        return
+
+    url = pending["url"]
+    description = pending["description"]
+    content = pending["content"]
+    filename = pending["filename"]
+    title = pending["title"]
+
+    emoji = _CATEGORY_EMOJI.get(category, "📋")
+    label = _CATEGORY_LABEL.get(category, category)
+
+    # Save raw and ingest with category metadata
+    wiki.save_raw(content, "articles", filename)
+
+    # Update the message to show the chosen category
+    await query.message.edit_text(
+        f"🔗 *Link categorized:* {emoji} {label}\n\n"
+        f"*Title:* {title}\n"
+        f"*Description:* _{description}_\n"
+        f"📥 `{url}`\n\n"
+        f"🔄 Ingesting into wiki…",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    # Ingest with category info prepended
+    enriched_content = (
+        f"---\n"
+        f"url: {url}\n"
+        f"title: {title}\n"
+        f"action_list: {label}\n"
+        f"description: {description}\n"
+        f"---\n\n"
+        f"{content}"
+    )
+    await do_ingest(query.message, enriched_content, "article", filename)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle plain text messages with smart intent detection.
     No command required — the bot figures out what you mean:
 
-      URL in message          → fetch + ingest
+      URL in message          → smart link categorization + ingest
       "What did I learn..."   → query wiki
       "Search online for..."  → web search
       "I went for a run..."   → journal ingest
@@ -716,28 +946,101 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not text:
         return
 
-    # ── 1. URL detection (highest priority) ──────────────────────────────────
+    # ── 1. URL detection (highest priority) — smart link categorization ───────
     url_match = URL_RE.search(text)
     if url_match:
         url = url_match.group(0)
         status_msg = await update.message.reply_text(
-            f"🧠 *Intent:* 📥 URL Fetch + Ingest\n"
-            f"_Detected URL in message (regex match)_\n\n"
-            f"🔄 Fetching `{url}`…",
+            f"🔗 *Smart Link Processing*\n"
+            f"_Detected URL in message_\n\n"
+            f"🔄 Step 1/3: Fetching `{url}`…",
             parse_mode=ParseMode.MARKDOWN,
         )
         try:
-            fetch_result = await fetch_url(url)
+            async with typing_indicator(update.message.chat_id, update.message.get_bot()):
+                fetch_result = await fetch_url(url)
+
             await _update_status(
                 status_msg,
-                f"🧠 *Intent:* 📥 URL Fetch + Ingest\n\n"
-                f"✅ Fetched: *{fetch_result.title}* ({fetch_result.word_count} words)\n"
-                f"🔄 Saving raw + ingesting…",
+                f"🔗 *Smart Link Processing*\n\n"
+                f"✅ Step 1/3: Fetched — *{fetch_result.title}* ({fetch_result.word_count} words)\n"
+                f"🔄 Step 2/3: Analyzing content & categorizing…\n"
+                f"_LLM is reading the page and deciding which action list it belongs to_",
             )
-            wiki.save_raw(fetch_result.content, "articles", fetch_result.filename)
-            await do_ingest(update.message, fetch_result.content, "article", fetch_result.filename)
+
+            # Classify the link using LLM
+            async with typing_indicator(update.message.chat_id, update.message.get_bot()):
+                classification = await asyncio.get_event_loop().run_in_executor(
+                    None, _classify_link, url, fetch_result.content, fetch_result.title
+                )
+
+            category = classification.get("category", "ambiguous")
+            description = classification.get("description", fetch_result.title)
+            confidence = classification.get("confidence", 0.0)
+
+            logger.info(
+                "link classified: url=%s category=%s confidence=%.2f desc=%r",
+                url[:60], category, confidence, description[:80],
+            )
+
+            if category == "ambiguous" or confidence < 0.6:
+                # Ambiguous — ask the user via inline keyboard
+                _pending_links[update.effective_user.id] = {
+                    "url": url,
+                    "description": description,
+                    "content": fetch_result.content,
+                    "filename": fetch_result.filename,
+                    "title": fetch_result.title,
+                }
+
+                buttons = [
+                    [InlineKeyboardButton("🛒 To Buy", callback_data="linkcat:to_buy")],
+                    [InlineKeyboardButton("🔍 To Review", callback_data="linkcat:to_review")],
+                    [InlineKeyboardButton("📖 To Read", callback_data="linkcat:to_read")],
+                ]
+                reply_markup = InlineKeyboardMarkup(buttons)
+
+                await status_msg.edit_text(
+                    f"🔗 *Link fetched:* *{fetch_result.title}*\n\n"
+                    f"📝 _{description}_\n\n"
+                    f"🤔 I'm not sure which list this belongs to.\n"
+                    f"*Which action list should I add it to?*",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=reply_markup,
+                )
+            else:
+                # Confident classification — auto-categorize and ingest
+                emoji = _CATEGORY_EMOJI.get(category, "📋")
+                label = _CATEGORY_LABEL.get(category, category)
+
+                await _update_status(
+                    status_msg,
+                    f"🔗 *Smart Link Processing*\n\n"
+                    f"✅ Step 1/3: Fetched — *{fetch_result.title}*\n"
+                    f"✅ Step 2/3: Categorized → {emoji} {label}\n"
+                    f"📝 _{description}_\n\n"
+                    f"🔄 Step 3/3: Saving raw + ingesting into wiki…",
+                )
+
+                wiki.save_raw(fetch_result.content, "articles", fetch_result.filename)
+
+                # Ingest with category info prepended
+                enriched_content = (
+                    f"---\n"
+                    f"url: {url}\n"
+                    f"title: {fetch_result.title}\n"
+                    f"action_list: {label}\n"
+                    f"description: {description}\n"
+                    f"---\n\n"
+                    f"{fetch_result.content}"
+                )
+                await do_ingest(
+                    update.message, enriched_content, "article", fetch_result.filename
+                )
+
         except Exception as e:
-            await status_msg.edit_text(f"❌ Could not fetch URL: {e}")
+            logger.exception("Smart link processing failed")
+            await status_msg.edit_text(_format_user_error(e), parse_mode=ParseMode.MARKDOWN)
         return
 
     # ── 2. Fast regex classification ─────────────────────────────────────────
@@ -769,9 +1072,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         logger.info("intent ambiguous — using LLM classifier for: %r", text[:60])
 
-        intent = await asyncio.get_event_loop().run_in_executor(
-            None, _classify_intent_llm, text
-        )
+        async with typing_indicator(update.message.chat_id, update.message.get_bot()):
+            intent = await asyncio.get_event_loop().run_in_executor(
+                None, _classify_intent_llm, text
+            )
 
         emoji = _INTENT_EMOJI.get(intent, "🤖")
         label = _INTENT_LABEL.get(intent, intent)
@@ -807,9 +1111,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"_LLM is reading your wiki and composing an answer_",
             )
 
-            result = await asyncio.get_event_loop().run_in_executor(
-                None, wiki.query, text
-            )
+            async with typing_indicator(update.message.chat_id, update.message.get_bot()):
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, wiki.query, text
+                )
             sources_text = ""
             if result.sources_consulted:
                 sources_text = "\n\n📚 " + ", ".join(f"`{s}`" for s in result.sources_consulted)
@@ -825,7 +1130,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
         except Exception as e:
             logger.exception("Query failed")
-            await status_msg.edit_text(f"❌ Query failed: {e}")
+            await status_msg.edit_text(_format_user_error(e), parse_mode=ParseMode.MARKDOWN)
 
     elif intent == "websearch":
         # Extract the search query (strip leading "search for", "find", etc.)
@@ -843,7 +1148,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             parse_mode=ParseMode.MARKDOWN,
         )
         try:
-            results = await web_search(query, max_results=5)
+            async with typing_indicator(update.message.chat_id, update.message.get_bot()):
+                results = await web_search(query, max_results=5)
             if not results:
                 await status_msg.edit_text(
                     f"🌐 *Web search:* `{query}`\n\n🔍 No results found.",
@@ -857,7 +1163,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await status_msg.edit_text("\n".join(lines)[:4000], parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
             logger.exception("Web search failed")
-            await status_msg.edit_text(f"❌ Web search failed: {e}")
+            await status_msg.edit_text(_format_user_error(e), parse_mode=ParseMode.MARKDOWN)
 
     else:
         # journal — ingest as a journal entry
@@ -958,8 +1264,9 @@ def main() -> None:
     app.add_handler(CommandHandler("index", cmd_index))
     app.add_handler(CommandHandler("save", cmd_save))
 
-    # Callback query handler (inline keyboard buttons)
+    # Callback query handlers (inline keyboard buttons)
     app.add_handler(CallbackQueryHandler(handle_view_page, pattern=r"^view:"))
+    app.add_handler(CallbackQueryHandler(handle_link_category_callback, pattern=r"^linkcat:"))
 
     # Message handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
