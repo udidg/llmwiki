@@ -96,6 +96,19 @@ async def deny(update: Update) -> None:
     await update.message.reply_text("⛔ Access denied.")
 
 
+# ── Verbose status helper ─────────────────────────────────────────────────────
+
+
+async def _update_status(msg: Message, text: str) -> Message:
+    """Edit an existing status message, appending a new line of progress."""
+    try:
+        await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        # If edit fails (e.g. message unchanged), just continue
+        pass
+    return msg
+
+
 # ── Ingest helper ─────────────────────────────────────────────────────────────
 
 
@@ -105,19 +118,50 @@ async def do_ingest(
     source_type: str,
     filename: str,
 ) -> None:
-    """Run ingest and reply with a formatted summary."""
+    """Run ingest and reply with a formatted summary showing each step."""
     await message.chat.send_action(ChatAction.TYPING)
-    status_msg = await message.reply_text("⏳ Ingesting… this may take a minute.")
+    word_count = len(content.split())
+
+    # Step 1: Starting
+    status_msg = await message.reply_text(
+        f"⏳ *Ingesting* `{filename}`\n"
+        f"📊 Source: {source_type} • {word_count} words\n\n"
+        f"🔄 Step 1/4: Assembling context (index + log)…",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
     try:
+        # Step 2: Sending to LLM
+        await _update_status(
+            status_msg,
+            f"⏳ *Ingesting* `{filename}`\n"
+            f"📊 Source: {source_type} • {word_count} words\n\n"
+            f"✅ Step 1/4: Context assembled\n"
+            f"🔄 Step 2/4: Sending to Ollama (`{OLLAMA_MODEL}`)…\n"
+            f"_LLM is reading the source and deciding what wiki pages to create/update_",
+        )
+
         result = await asyncio.get_event_loop().run_in_executor(
             None, wiki.ingest, content, source_type, filename
         )
-        wiki_search.rebuild_index()
 
+        # Step 3: File writes done
         created_list = "\n".join(f"  📄 `{p}`" for p in result.created) or "  (none)"
         updated_list = "\n".join(f"  ✏️ `{p}`" for p in result.updated) or "  (none)"
 
+        await _update_status(
+            status_msg,
+            f"⏳ *Ingesting* `{filename}`\n"
+            f"📊 Source: {source_type} • {word_count} words\n\n"
+            f"✅ Step 1/4: Context assembled\n"
+            f"✅ Step 2/4: Ollama processed\n"
+            f"✅ Step 3/4: Files written\n"
+            f"🔄 Step 4/4: Rebuilding search index…",
+        )
+
+        wiki_search.rebuild_index()
+
+        # Step 4: Done
         reply = (
             f"✅ *Ingested:* {result.title}\n\n"
             f"*Created:*\n{created_list}\n\n"
@@ -196,7 +240,23 @@ async def cmd_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.chat.send_action(ChatAction.TYPING)
 
+    # Verbose: show query plan
+    keywords = [w for w in question.lower().split() if len(w) > 3]
+    status_msg = await update.message.reply_text(
+        f"🔍 *Query:* _{question}_\n\n"
+        f"🔄 Step 1/3: Searching wiki for keywords: `{', '.join(keywords) or '(none)'}`…",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
     try:
+        await _update_status(
+            status_msg,
+            f"🔍 *Query:* _{question}_\n\n"
+            f"✅ Step 1/3: Keywords extracted\n"
+            f"🔄 Step 2/3: Loading relevant pages → asking Ollama (`{OLLAMA_MODEL}`)…\n"
+            f"_LLM is reading your wiki and composing an answer_",
+        )
+
         result = await asyncio.get_event_loop().run_in_executor(
             None, wiki.query, question
         )
@@ -219,10 +279,10 @@ async def cmd_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "question": question,
         }
 
-        await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
+        await status_msg.edit_text(reply, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.exception("Query failed")
-        await update.message.reply_text(f"❌ Query failed: {e}")
+        await status_msg.edit_text(f"❌ Query failed: {e}")
 
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -234,12 +294,23 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Usage: /search <keywords>")
         return
 
+    logger.info("cmd_search: terms=%r", terms)
     results = wiki_search.search(terms, top_k=5)
+    logger.info("cmd_search: %d result(s) found", len(results))
+
     if not results:
-        await update.message.reply_text("🔍 No results found in wiki.")
+        await update.message.reply_text(
+            f"🔍 *Search:* `{terms}`\n\n"
+            f"No results found in wiki.\n"
+            f"_Searched across all wiki pages using BM25 ranking._",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
-    lines = [f"🔍 *Wiki search:* `{terms}`\n"]
+    lines = [
+        f"🔍 *Wiki search:* `{terms}`\n"
+        f"_{len(results)} result(s) found via BM25 ranking_\n"
+    ]
     for i, r in enumerate(results, 1):
         lines.append(f"{i}. *{r.title}*\n   `{r.path}` (score: {r.score})\n   _{r.snippet}_\n")
 
@@ -256,15 +327,24 @@ async def cmd_websearch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("Usage: /websearch <query>")
         return
 
-    status_msg = await update.message.reply_text(f"🌐 Searching the web for: `{query}`…", parse_mode=ParseMode.MARKDOWN)
+    status_msg = await update.message.reply_text(
+        f"🌐 *Web search:* `{query}`\n\n"
+        f"🔄 Querying DuckDuckGo (no API key, HTML scrape)…",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
     try:
         results = await web_search(query, max_results=5)
         if not results:
-            await status_msg.edit_text("🔍 No web results found.")
+            await status_msg.edit_text(
+                f"🌐 *Web search:* `{query}`\n\n"
+                f"🔍 No results found.\n"
+                f"_DuckDuckGo returned no matching pages._",
+                parse_mode=ParseMode.MARKDOWN,
+            )
             return
 
-        lines = [f"🌐 *Web search:* `{query}`\n"]
+        lines = [f"🌐 *Web search:* `{query}`\n_{len(results)} result(s)_\n"]
         for i, r in enumerate(results, 1):
             lines.append(
                 f"{i}. *{r.title}*\n"
@@ -289,19 +369,34 @@ async def cmd_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Usage: /fetch <url>\nExample: /fetch https://example.com/article")
         return
 
-    status_msg = await update.message.reply_text(f"🌐 Fetching `{url}`…", parse_mode=ParseMode.MARKDOWN)
+    status_msg = await update.message.reply_text(
+        f"🌐 *Fetching URL*\n`{url}`\n\n"
+        f"🔄 Step 1/3: Downloading page…",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
     try:
         fetch_result: FetchResult = await fetch_url(url)
-        await status_msg.edit_text(
-            f"✅ Fetched: *{fetch_result.title}*\n"
-            f"📝 {fetch_result.word_count} words\n\n"
-            f"⏳ Ingesting into wiki…",
-            parse_mode=ParseMode.MARKDOWN,
+
+        await _update_status(
+            status_msg,
+            f"🌐 *Fetching URL*\n`{url}`\n\n"
+            f"✅ Step 1/3: Downloaded — *{fetch_result.title}*\n"
+            f"📝 {fetch_result.word_count} words extracted\n"
+            f"🔄 Step 2/3: Saving raw content…",
         )
 
         # Save raw and ingest
         wiki.save_raw(fetch_result.content, "articles", fetch_result.filename)
+
+        await _update_status(
+            status_msg,
+            f"🌐 *Fetching URL*\n`{url}`\n\n"
+            f"✅ Step 1/3: Downloaded — *{fetch_result.title}*\n"
+            f"✅ Step 2/3: Raw saved as `{fetch_result.filename}`\n"
+            f"🔄 Step 3/3: Ingesting into wiki…",
+        )
+
         await do_ingest(update.message, fetch_result.content, "article", fetch_result.filename)
 
     except Exception as e:
@@ -313,9 +408,22 @@ async def cmd_lint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return await deny(update)
 
-    status_msg = await update.message.reply_text("🔍 Running wiki health check… this may take a moment.")
+    page_count = len(wiki.list_pages())
+    status_msg = await update.message.reply_text(
+        f"🔍 *Wiki Health Check*\n\n"
+        f"🔄 Step 1/2: Loading all {page_count} wiki page(s)…",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
     try:
+        await _update_status(
+            status_msg,
+            f"🔍 *Wiki Health Check*\n\n"
+            f"✅ Step 1/2: Loaded {page_count} page(s)\n"
+            f"🔄 Step 2/2: Asking Ollama (`{OLLAMA_MODEL}`) to analyze…\n"
+            f"_LLM is checking for contradictions, orphans, missing concepts, stale content_",
+        )
+
         result = await asyncio.get_event_loop().run_in_executor(None, wiki.lint)
 
         lines = ["🔍 *Wiki Health Check*\n"]
@@ -372,6 +480,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     reply = (
         f"📊 *Wiki Status*\n\n"
         f"*Model:* `{result.model}`\n"
+        f"*Ollama:* `{OLLAMA_BASE_URL}`\n"
         f"*Total pages:* {result.total_pages}\n"
         f"  • Sources: {result.sources}\n"
         f"  • People: {result.people}\n"
@@ -423,7 +532,12 @@ async def cmd_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         path = wiki.save_insight(slug, content)
         wiki_search.rebuild_index()
-        await update.message.reply_text(f"💾 Saved as `{path}`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            f"💾 *Saved insight*\n\n"
+            f"📄 `{path}`\n"
+            f"🔍 Search index rebuilt",
+            parse_mode=ParseMode.MARKDOWN,
+        )
     except Exception as e:
         await update.message.reply_text(f"❌ Save failed: {e}")
 
@@ -493,6 +607,7 @@ def _classify_intent_llm(text: str) -> str:
     Use the LLM to classify intent for ambiguous messages.
     Returns: 'query' | 'websearch' | 'journal'
     """
+    logger.info("  → LLM intent classification for: %r", text[:80])
     system = (
         "You are an intent classifier for a personal knowledge base bot. "
         "Classify the user's message into exactly one of these intents:\n"
@@ -503,10 +618,29 @@ def _classify_intent_llm(text: str) -> str:
     )
     messages = [{"role": "user", "content": text}]
     response = ollama.chat(system, messages).strip().lower()
+    logger.info("  ← LLM classified intent as: %r", response)
     if response in ("query", "websearch", "journal"):
         return response
     # Default to journal if LLM gives unexpected output
+    logger.warning("  LLM returned unexpected intent %r — defaulting to 'journal'", response)
     return "journal"
+
+
+# ── Intent → emoji mapping ────────────────────────────────────────────────────
+
+_INTENT_EMOJI = {
+    "query": "❓",
+    "websearch": "🌐",
+    "fetch": "📥",
+    "journal": "📝",
+}
+
+_INTENT_LABEL = {
+    "query": "Wiki Query",
+    "websearch": "Web Search",
+    "fetch": "URL Fetch + Ingest",
+    "journal": "Journal Entry",
+}
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -531,13 +665,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if url_match:
         url = url_match.group(0)
         status_msg = await update.message.reply_text(
-            f"🌐 Fetching `{url}`…", parse_mode=ParseMode.MARKDOWN
+            f"🧠 *Intent:* 📥 URL Fetch + Ingest\n"
+            f"_Detected URL in message (regex match)_\n\n"
+            f"🔄 Fetching `{url}`…",
+            parse_mode=ParseMode.MARKDOWN,
         )
         try:
             fetch_result = await fetch_url(url)
-            await status_msg.edit_text(
-                f"✅ Fetched: *{fetch_result.title}* ({fetch_result.word_count} words)\n⏳ Ingesting…",
-                parse_mode=ParseMode.MARKDOWN,
+            await _update_status(
+                status_msg,
+                f"🧠 *Intent:* 📥 URL Fetch + Ingest\n\n"
+                f"✅ Fetched: *{fetch_result.title}* ({fetch_result.word_count} words)\n"
+                f"🔄 Saving raw + ingesting…",
             )
             wiki.save_raw(fetch_result.content, "articles", fetch_result.filename)
             await do_ingest(update.message, fetch_result.content, "article", fetch_result.filename)
@@ -548,19 +687,70 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # ── 2. Fast regex classification ─────────────────────────────────────────
     intent = _classify_intent_fast(text)
 
-    # ── 3. LLM classification for ambiguous messages ──────────────────────────
-    if intent is None:
-        thinking = await update.message.reply_text("🤔 …")
+    if intent:
+        # Show the fast classification result
+        emoji = _INTENT_EMOJI.get(intent, "🤖")
+        label = _INTENT_LABEL.get(intent, intent)
+        thinking = await update.message.reply_text(
+            f"🧠 *Intent:* {emoji} {label}\n"
+            f"_Classified via fast regex pattern match (no LLM needed)_",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        logger.info("intent classified (fast regex): %r → %s", text[:60], intent)
+        # Delete the thinking message after a short delay
+        await asyncio.sleep(1.5)
+        try:
+            await thinking.delete()
+        except Exception:
+            pass
+    else:
+        # ── 3. LLM classification for ambiguous messages ──────────────────────
+        thinking = await update.message.reply_text(
+            f"🧠 *Classifying intent…*\n"
+            f"_Message is ambiguous — asking Ollama (`{OLLAMA_MODEL}`) to classify_\n\n"
+            f"🔄 Sending to LLM intent classifier…",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        logger.info("intent ambiguous — using LLM classifier for: %r", text[:60])
+
         intent = await asyncio.get_event_loop().run_in_executor(
             None, _classify_intent_llm, text
         )
-        await thinking.delete()
+
+        emoji = _INTENT_EMOJI.get(intent, "🤖")
+        label = _INTENT_LABEL.get(intent, intent)
+        await _update_status(
+            thinking,
+            f"🧠 *Intent:* {emoji} {label}\n"
+            f"_Classified by Ollama LLM (message was ambiguous for regex)_",
+        )
+        await asyncio.sleep(1.5)
+        try:
+            await thinking.delete()
+        except Exception:
+            pass
 
     # ── 4. Route to the right handler ────────────────────────────────────────
     if intent == "query":
         # Treat as a wiki query
         await update.message.chat.send_action(ChatAction.TYPING)
+
+        keywords = [w for w in text.lower().split() if len(w) > 3]
+        status_msg = await update.message.reply_text(
+            f"🔍 *Query:* _{text[:80]}_\n\n"
+            f"🔄 Step 1/3: Searching wiki for keywords: `{', '.join(keywords) or '(none)'}`…",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
         try:
+            await _update_status(
+                status_msg,
+                f"🔍 *Query:* _{text[:80]}_\n\n"
+                f"✅ Step 1/3: Keywords extracted\n"
+                f"🔄 Step 2/3: Loading pages → asking Ollama (`{OLLAMA_MODEL}`)…\n"
+                f"_LLM is reading your wiki and composing an answer_",
+            )
+
             result = await asyncio.get_event_loop().run_in_executor(
                 None, wiki.query, text
             )
@@ -573,13 +763,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "save_as": result.save_as,
                 "question": text,
             }
-            await update.message.reply_text(
+            await status_msg.edit_text(
                 result.answer[:3800] + sources_text + save_hint,
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception as e:
             logger.exception("Query failed")
-            await update.message.reply_text(f"❌ Query failed: {e}")
+            await status_msg.edit_text(f"❌ Query failed: {e}")
 
     elif intent == "websearch":
         # Extract the search query (strip leading "search for", "find", etc.)
@@ -592,14 +782,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         ).strip() or text
 
         status_msg = await update.message.reply_text(
-            f"🌐 Searching the web for: `{query}`…", parse_mode=ParseMode.MARKDOWN
+            f"🌐 *Web search:* `{query}`\n\n"
+            f"🔄 Querying DuckDuckGo…",
+            parse_mode=ParseMode.MARKDOWN,
         )
         try:
             results = await web_search(query, max_results=5)
             if not results:
-                await status_msg.edit_text("🔍 No web results found.")
+                await status_msg.edit_text(
+                    f"🌐 *Web search:* `{query}`\n\n🔍 No results found.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
                 return
-            lines = [f"🌐 *Web search:* `{query}`\n"]
+            lines = [f"🌐 *Web search:* `{query}`\n_{len(results)} result(s)_\n"]
             for i, r in enumerate(results, 1):
                 lines.append(f"{i}. *{r.title}*\n   {r.url}\n   _{r.snippet}_\n")
             lines.append("\n💡 Fetch any result: `/fetch <url>` or just paste the URL")
@@ -612,6 +807,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # journal — ingest as a journal entry
         ts = datetime.now().strftime("%Y-%m-%d-%H-%M")
         filename = f"journal-{ts}.md"
+        logger.info("journal ingest: saving raw + ingesting as %s", filename)
         wiki.save_raw(text, "journals", filename)
         await do_ingest(update.message, text, "journal", filename)
 
@@ -632,14 +828,35 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    await update.message.reply_text(f"📥 Downloading `{fname}`…", parse_mode=ParseMode.MARKDOWN)
+    status_msg = await update.message.reply_text(
+        f"📥 *File upload:* `{fname}`\n\n"
+        f"🔄 Step 1/3: Downloading from Telegram…",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
         tg_file = await doc.get_file()
         await tg_file.download_to_drive(tmp.name)
         content = Path(tmp.name).read_text(encoding="utf-8", errors="replace")
 
+    word_count = len(content.split())
+    await _update_status(
+        status_msg,
+        f"📥 *File upload:* `{fname}`\n\n"
+        f"✅ Step 1/3: Downloaded ({word_count} words)\n"
+        f"🔄 Step 2/3: Saving raw content…",
+    )
+
     wiki.save_raw(content, "articles", fname)
+
+    await _update_status(
+        status_msg,
+        f"📥 *File upload:* `{fname}`\n\n"
+        f"✅ Step 1/3: Downloaded ({word_count} words)\n"
+        f"✅ Step 2/3: Raw saved\n"
+        f"🔄 Step 3/3: Ingesting into wiki…",
+    )
+
     await do_ingest(update.message, content, "article", fname)
 
 

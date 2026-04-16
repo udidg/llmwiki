@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 import urllib.parse
 from dataclasses import dataclass
 
@@ -98,6 +99,9 @@ async def fetch_url(url: str) -> FetchResult:
     Fetch a URL and return clean markdown content.
     Handles HTML pages and plain text/markdown files.
     """
+    logger.info("▶ fetch_url: GET %s", url)
+    t0 = time.time()
+
     async with httpx.AsyncClient(
         timeout=TIMEOUT,
         follow_redirects=True,
@@ -106,22 +110,43 @@ async def fetch_url(url: str) -> FetchResult:
         resp = await client.get(url)
         resp.raise_for_status()
 
+    elapsed = time.time() - t0
     content_type = resp.headers.get("content-type", "").lower()
+    raw_bytes = len(resp.content)
     raw = resp.text
+
+    logger.info(
+        "  HTTP %d  content-type=%r  raw_size=%s  elapsed=%.2fs",
+        resp.status_code,
+        content_type,
+        _fmt_bytes(raw_bytes),
+        elapsed,
+    )
 
     if "html" in content_type:
         title = _extract_title_from_html(raw)
+        logger.info("  extracted title: %r", title)
+        logger.info("  converting HTML → markdown (stripping script/style/nav/footer/header) …")
         md = markdownify(raw, heading_style="ATX", strip=["script", "style", "nav", "footer", "header"])
+        raw_md_len = len(md)
         md = _clean_markdown(md)
+        logger.info(
+            "  markdown conversion: raw_md=%d chars → cleaned=%d chars (removed %d chars of noise)",
+            raw_md_len, len(md), raw_md_len - len(md),
+        )
     else:
         # Plain text or markdown — use as-is
         title = url.split("/")[-1] or "Document"
         md = raw
+        logger.info("  plain text/markdown content — using as-is  title=%r", title)
 
     filename = _url_to_filename(url, title)
     word_count = len(md.split())
 
-    logger.info("Fetched %s → %d words", url, word_count)
+    logger.info(
+        "✓ fetch_url done  title=%r  filename=%s  words=%d  total_elapsed=%.2fs",
+        title, filename, word_count, time.time() - t0,
+    )
     return FetchResult(
         url=url,
         title=title,
@@ -139,6 +164,9 @@ async def web_search(query: str, max_results: int = 5) -> list[SearchResult]:
     Search the web using DuckDuckGo's HTML interface.
     Returns up to max_results results. No API key required.
     """
+    logger.info("▶ web_search: query=%r  max_results=%d", query, max_results)
+    t0 = time.time()
+
     encoded = urllib.parse.quote_plus(query)
     url = f"https://html.duckduckgo.com/html/?q={encoded}"
 
@@ -150,18 +178,24 @@ async def web_search(query: str, max_results: int = 5) -> list[SearchResult]:
         resp = await client.get(url)
         resp.raise_for_status()
 
+    elapsed = time.time() - t0
+    logger.info(
+        "  DDG HTTP %d  response_size=%s  elapsed=%.2fs",
+        resp.status_code, _fmt_bytes(len(resp.content)), elapsed,
+    )
+
     html = resp.text
     results: list[SearchResult] = []
 
     # Parse result blocks from DDG HTML
-    # Each result: <a class="result__a" href="...">title</a>
-    #              <a class="result__snippet">snippet</a>
     result_blocks = re.findall(
         r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?'
         r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
         html,
         re.DOTALL,
     )
+
+    logger.info("  parsed %d raw result block(s) from DDG HTML", len(result_blocks))
 
     for href, title_html, snippet_html in result_blocks[:max_results]:
         title = re.sub(r"<[^>]+>", "", title_html).strip()
@@ -176,8 +210,12 @@ async def web_search(query: str, max_results: int = 5) -> list[SearchResult]:
 
         if title and actual_url:
             results.append(SearchResult(title=title, url=actual_url, snippet=snippet))
+            logger.debug("  result: %r  url=%s", title, actual_url)
 
-    logger.info("DDG search '%s' → %d results", query, len(results))
+    logger.info(
+        "✓ web_search done  query=%r  results=%d  elapsed=%.2fs",
+        query, len(results), time.time() - t0,
+    )
     return results
 
 
@@ -186,7 +224,24 @@ async def web_search(query: str, max_results: int = 5) -> list[SearchResult]:
 
 async def search_and_fetch_top(query: str) -> FetchResult | None:
     """Search for query and fetch the top result."""
+    logger.info("search_and_fetch_top: query=%r", query)
     results = await web_search(query, max_results=1)
     if not results:
+        logger.info("search_and_fetch_top: no results found")
         return None
+    logger.info("search_and_fetch_top: fetching top result → %s", results[0].url)
     return await fetch_url(results[0].url)
+
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+
+
+def _fmt_bytes(n: int) -> str:
+    """Human-readable byte size."""
+    if n == 0:
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n //= 1024
+    return f"{n:.1f} TB"

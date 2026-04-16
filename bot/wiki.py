@@ -145,9 +145,11 @@ class WikiManager:
     def write_page(self, rel_path: str, content: str) -> None:
         """Write a wiki page. Creates parent dirs as needed."""
         p = self.data / rel_path
+        existed = p.exists()
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
-        logger.info("Wrote %s", rel_path)
+        action = "updated" if existed else "created"
+        logger.info("  ✎ file %s → %s (%d chars, %d lines)", action, rel_path, len(content), content.count("\n"))
 
     def append_log(self, entry: str) -> None:
         log = self.wiki / "log.md"
@@ -198,6 +200,7 @@ class WikiManager:
     def _load_pages_by_tags(self, tags: list[str]) -> str:
         """Load wiki pages whose frontmatter contains any of the given tags."""
         loaded: list[str] = []
+        matched_paths: list[str] = []
         for p in self.wiki.rglob("*.md"):
             if p.name in ("index.md", "log.md"):
                 continue
@@ -205,16 +208,24 @@ class WikiManager:
             if any(tag.lower() in content.lower() for tag in tags):
                 rel = str(p.relative_to(self.data))
                 loaded.append(f"## {rel}\n\n{content}")
+                matched_paths.append(rel)
+        if matched_paths:
+            logger.info("  loaded %d relevant page(s): %s", len(matched_paths), matched_paths)
+        else:
+            logger.info("  no wiki pages matched tags: %s", tags)
         return "\n\n---\n\n".join(loaded)
 
     def _load_all_wiki_pages(self) -> str:
         """Load all wiki pages (for lint)."""
         pages: list[str] = []
+        paths: list[str] = []
         for p in self.wiki.rglob("*.md"):
             if p.name == "log.md":
                 continue
             rel = str(p.relative_to(self.data))
             pages.append(f"## {rel}\n\n{p.read_text(encoding='utf-8')}")
+            paths.append(rel)
+        logger.info("  loaded %d wiki page(s) for lint: %s", len(paths), paths)
         return "\n\n---\n\n".join(pages)
 
     # ── Execute LLM file writes ───────────────────────────────────────────────
@@ -228,19 +239,34 @@ class WikiManager:
         created: list[str] = []
         updated: list[str] = []
 
+        if not file_blocks:
+            logger.info("  _execute_file_writes: no FILE: blocks in LLM response — nothing to write")
+            return created, updated
+
+        logger.info("  _execute_file_writes: processing %d file block(s)", len(file_blocks))
+
         for rel_path, content in file_blocks.items():
             # Security: only allow writes inside wiki/
             if not rel_path.startswith("wiki/"):
-                logger.warning("LLM tried to write outside wiki/: %s — skipped", rel_path)
+                logger.warning(
+                    "  ⛔ SECURITY: LLM tried to write outside wiki/: '%s' — skipped",
+                    rel_path,
+                )
                 continue
             full = self.data / rel_path
             existed = full.exists()
             self.write_page(rel_path, content)
             if existed:
                 updated.append(rel_path)
+                logger.info("  ✏️  updated: %s", rel_path)
             else:
                 created.append(rel_path)
+                logger.info("  📄 created: %s", rel_path)
 
+        logger.info(
+            "  _execute_file_writes done — created=%d  updated=%d",
+            len(created), len(updated),
+        )
         return created, updated
 
     # ── Operations ────────────────────────────────────────────────────────────
@@ -252,8 +278,17 @@ class WikiManager:
         source_type: 'journal' | 'article' | 'podcast' | 'note'
         filename: original filename (used for slug hint)
         """
+        word_count = len(source_content.split())
+        logger.info(
+            "━━ ingest START  type=%s  filename=%s  source_words=%d",
+            source_type, filename, word_count,
+        )
+
         system = self._system_prompt()
         context = self._base_context()
+
+        logger.info("  assembling prompt (system=%d chars, context=%d chars, source=%d chars)",
+                    len(system), len(context), len(source_content))
 
         user_msg = (
             f"{context}\n\n"
@@ -269,13 +304,22 @@ class WikiManager:
         )
 
         messages = [{"role": "user", "content": user_msg}]
+
+        logger.info("  → sending ingest prompt to Ollama …")
         response = self.ollama.chat(system, messages)
+        logger.info("  ← Ollama response received (%d chars)", len(response))
 
         # Execute file writes
+        logger.info("  executing file writes from LLM response …")
         created, updated = self._execute_file_writes(response)
 
         # Parse JSON summary
+        logger.info("  parsing JSON summary from response …")
         data = extract_json(response) or {}
+        if data:
+            logger.info("  JSON summary keys: %s", list(data.keys()))
+        else:
+            logger.warning("  no JSON summary found in response — using fallback values")
 
         result = IngestResult(
             slug=data.get("slug", slugify(filename)),
@@ -294,16 +338,31 @@ class WikiManager:
         )
         self.append_log(log_entry)
 
+        logger.info(
+            "━━ ingest DONE  title=%r  created=%d  updated=%d  summary=%r",
+            result.title, len(result.created), len(result.updated),
+            (result.summary[:80] + "…") if len(result.summary) > 80 else result.summary,
+        )
         return result
 
     def query(self, question: str) -> QueryResult:
         """Answer a question using the wiki as context."""
+        logger.info("━━ query START  question=%r", question[:120])
+
         system = self._system_prompt()
         context = self._base_context()
 
         # Load pages likely relevant to the question (simple keyword match)
         keywords = [w for w in question.lower().split() if len(w) > 3]
+        logger.info("  extracted %d keyword(s) for page matching: %s", len(keywords), keywords)
+
         relevant = self._load_pages_by_tags(keywords) if keywords else ""
+        relevant_chars = len(relevant)
+        logger.info(
+            "  relevant context: %d chars%s",
+            relevant_chars,
+            " (empty — no matching pages)" if not relevant_chars else "",
+        )
 
         user_msg = (
             f"{context}\n\n"
@@ -315,16 +374,30 @@ class WikiManager:
             f"Return the JSON object with your answer and sources_consulted."
         )
 
+        total_prompt_chars = len(system) + len(user_msg)
+        logger.info(
+            "  → sending query prompt to Ollama  total_prompt=%d chars (~%d tokens) …",
+            total_prompt_chars, total_prompt_chars // 4,
+        )
+
         messages = [{"role": "user", "content": user_msg}]
         response = self.ollama.chat(system, messages)
+        logger.info("  ← Ollama response received (%d chars)", len(response))
 
         # If LLM also wrote any insight pages, execute them
+        logger.info("  checking for any FILE: blocks in query response …")
         self._execute_file_writes(response)
 
+        logger.info("  parsing JSON answer from response …")
         data = extract_json(response) or {}
         answer = data.get("answer", response)
         sources = data.get("sources_consulted", [])
         save_as = data.get("save_as", "")
+
+        logger.info(
+            "  query result — sources=%s  save_as=%r  answer_chars=%d",
+            sources, save_as, len(answer),
+        )
 
         # Log the query
         self.append_log(
@@ -332,12 +405,18 @@ class WikiManager:
             f"- Pages consulted: {', '.join(sources) or 'none'}\n"
         )
 
+        logger.info("━━ query DONE")
         return QueryResult(answer=answer, sources_consulted=sources, save_as=save_as)
 
     def lint(self) -> LintResult:
         """Health-check the wiki."""
+        logger.info("━━ lint START")
+
         system = self._system_prompt()
+
+        logger.info("  loading all wiki pages …")
         all_pages = self._load_all_wiki_pages()
+        logger.info("  total wiki content for lint: %d chars", len(all_pages))
 
         user_msg = (
             f"## Task: Lint\n\n"
@@ -348,14 +427,15 @@ class WikiManager:
             f"Return the JSON lint report."
         )
 
+        logger.info("  → sending lint prompt to Ollama …")
         messages = [{"role": "user", "content": user_msg}]
         response = self.ollama.chat(system, messages)
+        logger.info("  ← Ollama response received (%d chars)", len(response))
 
+        logger.info("  parsing JSON lint report …")
         data = extract_json(response) or {}
 
-        self.append_log(f"## [{today()}] lint | Wiki health check\n")
-
-        return LintResult(
+        result = LintResult(
             contradictions=data.get("contradictions", []),
             orphans=data.get("orphans", []),
             missing_pages=data.get("missing_pages", []),
@@ -363,16 +443,28 @@ class WikiManager:
             suggestions=data.get("suggestions", []),
         )
 
+        logger.info(
+            "━━ lint DONE — contradictions=%d  orphans=%d  missing_pages=%d  stale=%d  suggestions=%d",
+            len(result.contradictions), len(result.orphans),
+            len(result.missing_pages), len(result.stale), len(result.suggestions),
+        )
+
+        self.append_log(f"## [{today()}] lint | Wiki health check\n")
+        return result
+
     def save_insight(self, slug: str, content: str) -> str:
         """Save a query answer as an insight page."""
         rel_path = f"wiki/insights/{slug}.md"
+        logger.info("save_insight: writing %s (%d chars)", rel_path, len(content))
         self.write_page(rel_path, content)
         self.append_log(f"## [{today()}] query | Saved insight: {slug}\n- Created: {rel_path}\n")
+        logger.info("save_insight: done → %s", rel_path)
         return rel_path
 
     def get_status(self, model: str) -> StatusResult:
         counts = self.count_pages_by_type()
         total = sum(counts.values())
+        logger.info("get_status: total=%d  by_type=%s", total, counts)
         return StatusResult(
             total_pages=total,
             sources=counts["sources"],
@@ -391,4 +483,5 @@ class WikiManager:
         dest = self.raw / subdir / filename
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(content, encoding="utf-8")
+        logger.info("save_raw: wrote %s (%d chars)", dest, len(content))
         return dest
