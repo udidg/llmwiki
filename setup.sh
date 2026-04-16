@@ -38,6 +38,11 @@ EOF
   echo "✅  .env saved"
 fi
 
+# ── Create data directory ─────────────────────────────────────────────────────
+echo ""
+echo "📂  Creating data directory …"
+mkdir -p "$WORKDIR/data"
+
 # ── Start the stack ───────────────────────────────────────────────────────────
 echo ""
 echo "🐳  Pulling images and starting stack …"
@@ -46,4 +51,5 @@ docker compose up -d
 
 echo ""
 echo "🎉  Done! Open Telegram, find your bot, and send /start"
+echo "    Wiki data is stored in: $WORKDIR/data/"
 echo "    Logs: docker compose -C $WORKDIR logs -f bot"

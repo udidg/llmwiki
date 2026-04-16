@@ -8,8 +8,5 @@ services:
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.1-flash-lite-preview}
       DATA_DIR: /data
     volumes:
-      - wiki_data:/data
+      - ./data:/data
     restart: unless-stopped
-
-volumes:
-  wiki_data:
