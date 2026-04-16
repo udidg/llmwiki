@@ -1,7 +1,7 @@
 services:
 
   bot:
-    build: ./bot
+    image: ghcr.io/udidg/llmwiki/llm-wiki-bot:latest
     env_file: .env
     environment:
       # Points to Ollama running natively on the host (not in Docker)
