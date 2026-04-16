@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# LLM Wiki — one-shot setup script
+# Usage: bash <(curl -fsSL https://raw.githubusercontent.com/udidg/llmwiki/main/setup.sh)
+set -euo pipefail
+
+REPO_RAW="https://raw.githubusercontent.com/udidg/llmwiki/main"
+WORKDIR="${LLMWIKI_DIR:-$HOME/llmwiki}"
+
+echo "📁  Creating working directory: $WORKDIR"
+mkdir -p "$WORKDIR"
+cd "$WORKDIR"
+
+# ── Fetch docker-compose.yml ──────────────────────────────────────────────────
+echo "⬇️   Fetching docker-compose.yml …"
+curl -fsSL "$REPO_RAW/docker-compose.yml" -o docker-compose.yml
+echo "✅  docker-compose.yml saved"
+
+# ── Create .env if it doesn't exist ──────────────────────────────────────────
+if [[ -f .env ]]; then
+  echo "ℹ️   .env already exists — skipping (delete it to reconfigure)"
+else
+  echo ""
+  echo "🔑  Bot configuration"
+  echo "────────────────────────────────────────"
+
+  read -rp "  Telegram bot token : " TELEGRAM_TOKEN
+  read -rp "  Your Telegram user ID : " TELEGRAM_ALLOWED_USERS
+  read -rp "  Ollama model [gemma4:e4b] : " OLLAMA_MODEL
+  OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:e4b}"
+
+  cat > .env <<EOF
+TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS}
+OLLAMA_MODEL=${OLLAMA_MODEL}
+EOF
+  echo "✅  .env saved"
+fi
+
+# ── Start the stack ───────────────────────────────────────────────────────────
+echo ""
+echo "🐳  Pulling images and starting stack …"
+docker compose pull
+docker compose up -d
+
+# ── Pull the Ollama model ─────────────────────────────────────────────────────
+OLLAMA_MODEL_VAL=$(grep OLLAMA_MODEL .env | cut -d= -f2)
+OLLAMA_MODEL_VAL="${OLLAMA_MODEL_VAL:-gemma4:e4b}"
+
+echo ""
+echo "🧠  Pulling Ollama model: $OLLAMA_MODEL_VAL  (this may take a few minutes) …"
+docker compose exec ollama ollama pull "$OLLAMA_MODEL_VAL"
+
+echo ""
+echo "🎉  Done! Open Telegram, find your bot, and send /start"
+echo "    Logs: docker compose -C $WORKDIR logs -f bot"
