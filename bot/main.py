@@ -217,6 +217,19 @@ def _format_user_error(error: Exception) -> str:
     )
 
 
+# ── Markdown safety helpers ───────────────────────────────────────────────────
+
+
+def _escape_code_block(text: str) -> str:
+    """Escape backticks in text so it can be safely wrapped in a Markdown code block.
+
+    Telegram's Markdown v1 parser breaks when the content inside a ```
+    code fence contains backticks.  We replace them with the visually
+    similar Unicode character ʻ (modifier letter turned comma / okina).
+    """
+    return text.replace("`", "ʻ")
+
+
 # ── Verbose status helper ─────────────────────────────────────────────────────
 
 
@@ -335,14 +348,15 @@ async def handle_view_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     header = f"📖 *{rel_path}*\n\n"
     max_chunk = 4000 - len(header)
 
-    if len(content) <= max_chunk:
+    safe_content = _escape_code_block(content)
+    if len(safe_content) <= max_chunk:
         await query.message.reply_text(
-            f"{header}```\n{content}\n```",
+            f"{header}```\n{safe_content}\n```",
             parse_mode=ParseMode.MARKDOWN,
         )
     else:
         # Send in chunks
-        chunks = [content[i : i + max_chunk] for i in range(0, len(content), max_chunk)]
+        chunks = [safe_content[i : i + max_chunk] for i in range(0, len(safe_content), max_chunk)]
         for i, chunk in enumerate(chunks, 1):
             chunk_header = f"📖 *{rel_path}* (part {i}/{len(chunks)})\n\n"
             await query.message.reply_text(
@@ -683,7 +697,7 @@ async def cmd_index(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     chunks = [index_content[i : i + 4000] for i in range(0, len(index_content), 4000)]
     for chunk in chunks:
-        await update.message.reply_text(f"```\n{chunk}\n```", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"```\n{_escape_code_block(chunk)}\n```", parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
