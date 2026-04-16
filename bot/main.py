@@ -437,33 +437,22 @@ async def cmd_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.chat.send_action(ChatAction.TYPING)
 
-    # Verbose: show BM25 search step
+    # Verbose: show query expansion + BM25 search steps
     status_msg = await update.message.reply_text(
         f"🔍 *Query:* _{question}_\n\n"
-        f"🔄 Step 1/3: BM25 searching wiki for relevant pages…",
+        f"🔄 Step 1/2: Expanding query + BM25 searching wiki…\n"
+        f"_LLM generates alternative search terms, then BM25 finds relevant pages_",
         parse_mode=ParseMode.MARKDOWN,
     )
 
     try:
-        # Preview BM25 search results in status
-        preview_results = wiki_search.search(question, top_k=5, min_score=0.5)
-        if preview_results:
-            pages_preview = ", ".join(f"`{r.path}` ({r.score})" for r in preview_results[:3])
-            await _update_status(
-                status_msg,
-                f"🔍 *Query:* _{question}_\n\n"
-                f"✅ Step 1/3: Found {len(preview_results)} relevant page(s): {pages_preview}\n"
-                f"🔄 Step 2/3: Loading pages → asking Gemini (`{GEMINI_MODEL}`)…\n"
-                f"_LLM is reading your wiki and composing an answer_",
-            )
-        else:
-            await _update_status(
-                status_msg,
-                f"🔍 *Query:* _{question}_\n\n"
-                f"⚠️ Step 1/3: No strong matches found — will use best available pages\n"
-                f"🔄 Step 2/3: Loading pages → asking Gemini (`{GEMINI_MODEL}`)…\n"
-                f"_LLM is reading your wiki and composing an answer_",
-            )
+        await _update_status(
+            status_msg,
+            f"🔍 *Query:* _{question}_\n\n"
+            f"✅ Step 1/2: Query expanded + pages found\n"
+            f"🔄 Step 2/2: Loading pages → asking Gemini (`{GEMINI_MODEL}`)…\n"
+            f"_LLM is reading your wiki and composing an answer_",
+        )
 
         async with typing_indicator(update.message.chat_id, update.message.get_bot()):
             result = await asyncio.get_event_loop().run_in_executor(
@@ -1135,30 +1124,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         status_msg = await update.message.reply_text(
             f"🔍 *Query:* _{text[:80]}_\n\n"
-            f"🔄 Step 1/3: BM25 searching wiki for relevant pages…",
+            f"🔄 Step 1/2: Expanding query + BM25 searching wiki…\n"
+            f"_LLM generates alternative search terms, then BM25 finds relevant pages_",
             parse_mode=ParseMode.MARKDOWN,
         )
 
         try:
-            # Preview BM25 search results in status
-            preview_results = wiki_search.search(text, top_k=5, min_score=0.5)
-            if preview_results:
-                pages_preview = ", ".join(f"`{r.path}` ({r.score})" for r in preview_results[:3])
-                await _update_status(
-                    status_msg,
-                    f"🔍 *Query:* _{text[:80]}_\n\n"
-                    f"✅ Step 1/3: Found {len(preview_results)} relevant page(s): {pages_preview}\n"
-                    f"🔄 Step 2/3: Loading pages → asking Gemini (`{GEMINI_MODEL}`)…\n"
-                    f"_LLM is reading your wiki and composing an answer_",
-                )
-            else:
-                await _update_status(
-                    status_msg,
-                    f"🔍 *Query:* _{text[:80]}_\n\n"
-                    f"⚠️ Step 1/3: No strong matches — will use best available pages\n"
-                    f"🔄 Step 2/3: Loading pages → asking Gemini (`{GEMINI_MODEL}`)…\n"
-                    f"_LLM is reading your wiki and composing an answer_",
-                )
+            await _update_status(
+                status_msg,
+                f"🔍 *Query:* _{text[:80]}_\n\n"
+                f"✅ Step 1/2: Query expanded + pages found\n"
+                f"🔄 Step 2/2: Loading pages → asking Gemini (`{GEMINI_MODEL}`)…\n"
+                f"_LLM is reading your wiki and composing an answer_",
+            )
 
             async with typing_indicator(update.message.chat_id, update.message.get_bot()):
                 result = await asyncio.get_event_loop().run_in_executor(

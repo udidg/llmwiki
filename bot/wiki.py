@@ -240,8 +240,61 @@ class WikiManager:
         log_tail = "\n".join(self.last_log_entries(10))
         return f"## Current Wiki Index\n\n{index}\n\n## Recent Log\n\n{log_tail}"
 
+    def _expand_query(self, question: str) -> list[str]:
+        """Use the LLM to expand a user question into multiple search queries.
+
+        This bridges the vocabulary gap between how users ask questions
+        and how wiki pages are written. For example:
+          "What helps me fall asleep faster?"
+          → ["sleep onset", "falling asleep", "sleep hygiene", "insomnia", "melatonin"]
+
+        Returns a list of 3-5 search query strings (always includes the original).
+        """
+        logger.info("  _expand_query: expanding question=%r", question[:80])
+
+        system = (
+            "You are a search query expander for a personal knowledge base. "
+            "Given a user's question, generate 3-5 alternative search queries that "
+            "would help find relevant wiki pages. Think about:\n"
+            "- Synonyms and related terms\n"
+            "- Technical/scientific terms for colloquial language\n"
+            "- Specific concepts the question might relate to\n"
+            "- Key entities (people, topics) mentioned or implied\n\n"
+            "Reply with ONLY a JSON array of strings. No explanation.\n"
+            'Example: ["sleep onset latency", "falling asleep tips", "melatonin dosage", "sleep hygiene"]'
+        )
+        messages = [{"role": "user", "content": question}]
+
+        try:
+            response = self.llm.chat(system, messages).strip()
+            logger.info("  _expand_query: LLM response=%r", response[:200])
+
+            # Parse JSON array from response
+            import json
+            # Try to find a JSON array in the response
+            start = response.find("[")
+            end = response.rfind("]")
+            if start != -1 and end != -1:
+                queries = json.loads(response[start:end + 1])
+                if isinstance(queries, list) and all(isinstance(q, str) for q in queries):
+                    # Always include the original question as the first query
+                    result = [question] + [q for q in queries if q.lower() != question.lower()]
+                    logger.info("  _expand_query: expanded to %d queries: %s", len(result), result)
+                    return result
+
+            logger.warning("  _expand_query: could not parse LLM response — using original query only")
+        except Exception as e:
+            logger.warning("  _expand_query: LLM call failed (%s) — using original query only", e)
+
+        return [question]
+
     def _load_pages_by_search(self, query: str) -> tuple[str, list[str]]:
-        """Use BM25 search to find and load relevant wiki pages.
+        """Use LLM query expansion + BM25 search to find and load relevant wiki pages.
+
+        1. Expands the user's question into multiple search queries via LLM
+        2. Runs BM25 search for each expanded query
+        3. Merges results, keeping the highest score per page
+        4. Returns formatted context and list of paths consulted
 
         Returns (formatted_context, list_of_paths_consulted).
         """
@@ -250,17 +303,41 @@ class WikiManager:
             return self._load_pages_by_tags_legacy(query.split()), []
 
         from search import SearchResultWithContent
-        results = self.search.search_with_content(query, top_k=8, min_score=1.0, fallback_k=3)
 
-        if not results:
+        # Step 1: Expand the query into multiple search terms
+        expanded_queries = self._expand_query(query)
+
+        # Step 2: Run BM25 for each query and merge results
+        best_by_path: dict[str, SearchResultWithContent] = {}
+
+        for q in expanded_queries:
+            results = self.search.search_with_content(q, top_k=5, min_score=0.5, fallback_k=0)
+            for r in results:
+                existing = best_by_path.get(r.path)
+                if existing is None or r.score > existing.score:
+                    best_by_path[r.path] = r
+
+        logger.info(
+            "  _load_pages_by_search: %d unique page(s) found across %d expanded queries",
+            len(best_by_path), len(expanded_queries),
+        )
+
+        # Step 3: If nothing found via expansion, try the original query with fallback
+        if not best_by_path:
+            results = self.search.search_with_content(query, top_k=8, min_score=1.0, fallback_k=3)
+            for r in results:
+                best_by_path[r.path] = r
+
+        if not best_by_path:
             logger.info("  _load_pages_by_search: no results for query=%r", query[:60])
             return "", []
 
+        # Step 4: Sort by score descending, cap at 8 pages
+        sorted_results = sorted(best_by_path.values(), key=lambda r: r.score, reverse=True)[:8]
+
         loaded: list[str] = []
         paths: list[str] = []
-        for r in results:
-            # Prefix each page with its path and BM25 score so the LLM
-            # knows which pages are most relevant
+        for r in sorted_results:
             loaded.append(
                 f"### wiki/{r.path}  (relevance score: {r.score})\n\n{r.content}"
             )
