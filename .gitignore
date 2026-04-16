@@ -1,0 +1,28 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Docker volumes (local dev bind mounts)
+data/wiki/
+data/raw/
+
+# Keep data directory structure but not content
+!data/.gitkeep
+!data/AGENTS.md
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp

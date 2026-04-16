@@ -1,0 +1,7 @@
+python-telegram-bot==21.*
+httpx[http2]
+markdownify
+rank-bm25
+python-dotenv
+rich
+PyYAML
