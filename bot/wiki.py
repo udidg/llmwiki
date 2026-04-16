@@ -14,9 +14,12 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from gemini import GeminiClient, extract_json, parse_file_blocks
+
+if TYPE_CHECKING:
+    from search import WikiSearch
 
 logger = logging.getLogger(__name__)
 
@@ -100,11 +103,12 @@ class WikiManager:
         insights/
     """
 
-    def __init__(self, data_dir: str, llm: GeminiClient) -> None:
+    def __init__(self, data_dir: str, llm: GeminiClient, search: "WikiSearch | None" = None) -> None:
         self.data = Path(data_dir)
         self.raw = self.data / "raw"
         self.wiki = self.data / "wiki"
         self.llm = llm
+        self.search = search
         self._ensure_dirs()
 
     # ── Setup ─────────────────────────────────────────────────────────────────
@@ -131,6 +135,14 @@ class WikiManager:
             log.write_text(
                 "# Wiki Log\n\nAppend-only chronological record of all operations.\n"
                 "Format: `## [YYYY-MM-DD] <operation> | <title>`\n\n---\n"
+            )
+
+        feedback = self.wiki / "feedback.md"
+        if not feedback.exists():
+            feedback.write_text(
+                "# Query Feedback\n\n"
+                "Positively-rated Q&A pairs (user reacted with 👍/👌/❤️/🔥).\n"
+                "The LLM uses these as examples of good answers.\n\n---\n"
             )
 
     # ── File I/O ──────────────────────────────────────────────────────────────
@@ -189,6 +201,37 @@ class WikiManager:
             return agents.read_text(encoding="utf-8")
         return "You are a wiki maintainer. Read sources and write structured markdown pages."
 
+    # ── Feedback ──────────────────────────────────────────────────────────────
+
+    def append_feedback(self, question: str, answer_snippet: str) -> None:
+        """Append a positively-rated Q&A pair to the feedback log."""
+        feedback = self.wiki / "feedback.md"
+        snippet = answer_snippet[:300].replace("\n", " ").strip()
+        entry = (
+            f"\n## [{today()}] ✅ Good answer\n"
+            f"**Q:** {question}\n"
+            f"**A:** {snippet}\n"
+        )
+        existing = feedback.read_text(encoding="utf-8")
+        feedback.write_text(existing + entry, encoding="utf-8")
+        logger.info("append_feedback: logged positive feedback for question=%r", question[:60])
+
+    def _load_recent_feedback(self, n: int = 5) -> str:
+        """Load the last n positively-rated Q&A pairs for LLM context."""
+        feedback = self.wiki / "feedback.md"
+        if not feedback.exists():
+            return ""
+        content = feedback.read_text(encoding="utf-8")
+        # Parse feedback entries (each starts with "## [")
+        entries = re.split(r"(?=\n## \[)", content)
+        # Filter to actual entries (skip the header)
+        entries = [e.strip() for e in entries if e.strip().startswith("## [")]
+        if not entries:
+            return ""
+        recent = entries[-n:]
+        logger.info("  loaded %d recent feedback example(s)", len(recent))
+        return "\n\n".join(recent)
+
     # ── Context assembly ──────────────────────────────────────────────────────
 
     def _base_context(self) -> str:
@@ -197,12 +240,44 @@ class WikiManager:
         log_tail = "\n".join(self.last_log_entries(10))
         return f"## Current Wiki Index\n\n{index}\n\n## Recent Log\n\n{log_tail}"
 
-    def _load_pages_by_tags(self, tags: list[str]) -> str:
-        """Load wiki pages whose frontmatter contains any of the given tags."""
+    def _load_pages_by_search(self, query: str) -> tuple[str, list[str]]:
+        """Use BM25 search to find and load relevant wiki pages.
+
+        Returns (formatted_context, list_of_paths_consulted).
+        """
+        if self.search is None:
+            logger.warning("  _load_pages_by_search: no WikiSearch instance — falling back to tag match")
+            return self._load_pages_by_tags_legacy(query.split()), []
+
+        from search import SearchResultWithContent
+        results = self.search.search_with_content(query, top_k=8, min_score=1.0, fallback_k=3)
+
+        if not results:
+            logger.info("  _load_pages_by_search: no results for query=%r", query[:60])
+            return "", []
+
+        loaded: list[str] = []
+        paths: list[str] = []
+        for r in results:
+            # Prefix each page with its path and BM25 score so the LLM
+            # knows which pages are most relevant
+            loaded.append(
+                f"### wiki/{r.path}  (relevance score: {r.score})\n\n{r.content}"
+            )
+            paths.append(f"wiki/{r.path}")
+
+        logger.info(
+            "  _load_pages_by_search: loaded %d page(s) for query=%r: %s",
+            len(paths), query[:60], paths,
+        )
+        return "\n\n---\n\n".join(loaded), paths
+
+    def _load_pages_by_tags_legacy(self, tags: list[str]) -> str:
+        """Legacy fallback: load wiki pages whose content contains any of the given tags."""
         loaded: list[str] = []
         matched_paths: list[str] = []
         for p in self.wiki.rglob("*.md"):
-            if p.name in ("index.md", "log.md"):
+            if p.name in ("index.md", "log.md", "feedback.md"):
                 continue
             content = p.read_text(encoding="utf-8")
             if any(tag.lower() in content.lower() for tag in tags):
@@ -210,7 +285,7 @@ class WikiManager:
                 loaded.append(f"## {rel}\n\n{content}")
                 matched_paths.append(rel)
         if matched_paths:
-            logger.info("  loaded %d relevant page(s): %s", len(matched_paths), matched_paths)
+            logger.info("  loaded %d relevant page(s) (legacy tag match): %s", len(matched_paths), matched_paths)
         else:
             logger.info("  no wiki pages matched tags: %s", tags)
         return "\n\n---\n\n".join(loaded)
@@ -371,32 +446,52 @@ class WikiManager:
         return result
 
     def query(self, question: str) -> QueryResult:
-        """Answer a question using the wiki as context."""
+        """Answer a question using the wiki as context.
+
+        Uses BM25 search to find the most relevant pages, loads their full
+        content into the LLM prompt (ranked by relevance score), and includes
+        recent positive feedback examples so the LLM learns the user's
+        preferred answer style.
+        """
         logger.info("━━ query START  question=%r", question[:120])
 
         system = self._system_prompt()
         context = self._base_context()
 
-        # Load pages likely relevant to the question (simple keyword match)
-        keywords = [w for w in question.lower().split() if len(w) > 3]
-        logger.info("  extracted %d keyword(s) for page matching: %s", len(keywords), keywords)
-
-        relevant = self._load_pages_by_tags(keywords) if keywords else ""
+        # BM25 search for relevant pages (replaces naive keyword matching)
+        logger.info("  running BM25 search for relevant wiki pages …")
+        relevant, searched_paths = self._load_pages_by_search(question)
         relevant_chars = len(relevant)
         logger.info(
-            "  relevant context: %d chars%s",
-            relevant_chars,
+            "  relevant context: %d chars, %d page(s)%s",
+            relevant_chars, len(searched_paths),
             " (empty — no matching pages)" if not relevant_chars else "",
         )
 
+        # Load recent positive feedback examples
+        feedback = self._load_recent_feedback(n=5)
+        feedback_section = ""
+        if feedback:
+            feedback_section = (
+                f"## Examples of Answers the User Liked\n\n"
+                f"The following Q&A pairs were positively rated by the user. "
+                f"Use them as style and quality examples.\n\n{feedback}\n\n---\n\n"
+            )
+
         user_msg = (
             f"{context}\n\n"
-            + (f"## Relevant Wiki Pages\n\n{relevant}\n\n---\n\n" if relevant else "")
+            + (f"## Relevant Wiki Pages (BM25-ranked, highest relevance first)\n\n"
+               f"These pages were pre-searched and ranked by relevance to the question. "
+               f"Prioritize higher-scored pages but consider all provided context.\n\n"
+               f"{relevant}\n\n---\n\n" if relevant else
+               "## Relevant Wiki Pages\n\nNo wiki pages matched this query.\n\n---\n\n")
+            + feedback_section
             + f"## Task: Query\n\n"
             f"Today's date: {today()}\n\n"
             f"Question: {question}\n\n"
             f"Follow the Query Workflow from AGENTS.md. "
-            f"Return the JSON object with your answer and sources_consulted."
+            f"Return the JSON object with your answer and sources_consulted. "
+            f"Only cite pages that were actually provided above — do NOT invent sources."
         )
 
         total_prompt_chars = len(system) + len(user_msg)
@@ -416,7 +511,7 @@ class WikiManager:
         logger.info("  parsing JSON answer from response …")
         data = extract_json(response) or {}
         answer = data.get("answer", response)
-        sources = data.get("sources_consulted", [])
+        sources = data.get("sources_consulted", searched_paths if not data.get("sources_consulted") else data["sources_consulted"])
         save_as = data.get("save_as", "")
 
         logger.info(

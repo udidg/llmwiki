@@ -211,10 +211,21 @@ END_FILE
 
 When asked a question:
 
-1. Read `wiki/index.md` to identify relevant pages.
-2. Read the relevant pages (list them).
+**Important:** You do NOT need to search for pages yourself. The bot has already
+pre-searched the wiki using BM25 ranking and provided the most relevant pages
+in the prompt under "Relevant Wiki Pages". Each page is labeled with its
+relevance score (higher = more relevant).
+
+1. Read the **pre-searched wiki pages** provided in the prompt. They are ranked
+   by relevance — prioritize higher-scored pages but consider all provided context.
+2. If "Examples of Answers the User Liked" are provided, study them to understand
+   the user's preferred answer style, length, and level of detail.
 3. Synthesize a clear, direct answer with `[[page]]` citations.
-4. **Return a JSON object**:
+4. **Only cite pages that were actually provided** in the prompt. Do NOT invent
+   or hallucinate sources that weren't given to you.
+5. If no relevant pages were provided (or the provided pages don't contain the
+   answer), say so honestly — do NOT make up information.
+6. **Return a JSON object**:
 
 ```json
 {
@@ -289,6 +300,20 @@ When the user shares web search results and asks you to analyze or ingest them:
 
 ---
 
+## Feedback & Learning
+
+The bot tracks which answers the user liked (via emoji reactions like 👍, 👌, ❤️, 🔥).
+When available, recent positively-rated Q&A pairs are included in the query prompt
+under "Examples of Answers the User Liked".
+
+**How to use feedback examples:**
+- Study the answer style: length, tone, level of detail, use of citations.
+- If the user consistently likes concise answers, keep yours concise.
+- If the user likes detailed breakdowns with bullet points, follow that pattern.
+- The feedback examples are a guide, not a rigid template — adapt to each question.
+
+---
+
 ## Important Rules
 
 - **Always use `[[wiki-links]]`** for cross-references between pages. Never use bare filenames.
@@ -297,3 +322,5 @@ When the user shares web search results and asks you to analyze or ingest them:
 - **Slugs** must be lowercase, hyphen-separated, no spaces or special characters.
 - **Frontmatter** must be valid YAML between `---` delimiters.
 - When updating an existing page, preserve all existing content and append/integrate new information. Do not delete existing entries.
+- **Never invent or hallucinate wiki pages** that weren't provided in the prompt context.
+- **Never fabricate sources** — only cite pages you were actually given.

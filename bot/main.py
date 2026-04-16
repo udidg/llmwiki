@@ -87,6 +87,12 @@ wiki_search: WikiSearch
 # Per-user state: last query result for /save
 _last_query: dict[int, dict] = {}
 
+# Per-user state: map message_id → query data for emoji feedback tracking
+_query_answer_messages: dict[int, dict] = {}
+
+# Positive feedback emoji set
+_POSITIVE_EMOJI = {"👍", "👌", "❤️", "🔥", "💯", "🙏"}
+
 # ── Access control ────────────────────────────────────────────────────────────
 
 
@@ -431,22 +437,33 @@ async def cmd_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.chat.send_action(ChatAction.TYPING)
 
-    # Verbose: show query plan
-    keywords = [w for w in question.lower().split() if len(w) > 3]
+    # Verbose: show BM25 search step
     status_msg = await update.message.reply_text(
         f"🔍 *Query:* _{question}_\n\n"
-        f"🔄 Step 1/3: Searching wiki for keywords: `{', '.join(keywords) or '(none)'}`…",
+        f"🔄 Step 1/3: BM25 searching wiki for relevant pages…",
         parse_mode=ParseMode.MARKDOWN,
     )
 
     try:
-        await _update_status(
-            status_msg,
-            f"🔍 *Query:* _{question}_\n\n"
-            f"✅ Step 1/3: Keywords extracted\n"
-            f"🔄 Step 2/3: Loading relevant pages → asking Gemini (`{GEMINI_MODEL}`)…\n"
-            f"_LLM is reading your wiki and composing an answer_",
-        )
+        # Preview BM25 search results in status
+        preview_results = wiki_search.search(question, top_k=5, min_score=0.5)
+        if preview_results:
+            pages_preview = ", ".join(f"`{r.path}` ({r.score})" for r in preview_results[:3])
+            await _update_status(
+                status_msg,
+                f"🔍 *Query:* _{question}_\n\n"
+                f"✅ Step 1/3: Found {len(preview_results)} relevant page(s): {pages_preview}\n"
+                f"🔄 Step 2/3: Loading pages → asking Gemini (`{GEMINI_MODEL}`)…\n"
+                f"_LLM is reading your wiki and composing an answer_",
+            )
+        else:
+            await _update_status(
+                status_msg,
+                f"🔍 *Query:* _{question}_\n\n"
+                f"⚠️ Step 1/3: No strong matches found — will use best available pages\n"
+                f"🔄 Step 2/3: Loading pages → asking Gemini (`{GEMINI_MODEL}`)…\n"
+                f"_LLM is reading your wiki and composing an answer_",
+            )
 
         async with typing_indicator(update.message.chat_id, update.message.get_bot()):
             result = await asyncio.get_event_loop().run_in_executor(
@@ -471,7 +488,14 @@ async def cmd_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "question": question,
         }
 
-        await status_msg.edit_text(reply, parse_mode=ParseMode.MARKDOWN)
+        answer_msg = await status_msg.edit_text(reply, parse_mode=ParseMode.MARKDOWN)
+
+        # Track this message for emoji feedback
+        _query_answer_messages[answer_msg.message_id] = {
+            "question": question,
+            "answer": result.answer[:300],
+            "user_id": update.effective_user.id,
+        }
     except Exception as e:
         logger.exception("Query failed")
         await status_msg.edit_text(_format_user_error(e), parse_mode=ParseMode.MARKDOWN)
@@ -1109,21 +1133,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # Treat as a wiki query
         await update.message.chat.send_action(ChatAction.TYPING)
 
-        keywords = [w for w in text.lower().split() if len(w) > 3]
         status_msg = await update.message.reply_text(
             f"🔍 *Query:* _{text[:80]}_\n\n"
-            f"🔄 Step 1/3: Searching wiki for keywords: `{', '.join(keywords) or '(none)'}`…",
+            f"🔄 Step 1/3: BM25 searching wiki for relevant pages…",
             parse_mode=ParseMode.MARKDOWN,
         )
 
         try:
-            await _update_status(
-                status_msg,
-                f"🔍 *Query:* _{text[:80]}_\n\n"
-                f"✅ Step 1/3: Keywords extracted\n"
-                f"🔄 Step 2/3: Loading pages → asking Gemini (`{GEMINI_MODEL}`)…\n"
-                f"_LLM is reading your wiki and composing an answer_",
-            )
+            # Preview BM25 search results in status
+            preview_results = wiki_search.search(text, top_k=5, min_score=0.5)
+            if preview_results:
+                pages_preview = ", ".join(f"`{r.path}` ({r.score})" for r in preview_results[:3])
+                await _update_status(
+                    status_msg,
+                    f"🔍 *Query:* _{text[:80]}_\n\n"
+                    f"✅ Step 1/3: Found {len(preview_results)} relevant page(s): {pages_preview}\n"
+                    f"🔄 Step 2/3: Loading pages → asking Gemini (`{GEMINI_MODEL}`)…\n"
+                    f"_LLM is reading your wiki and composing an answer_",
+                )
+            else:
+                await _update_status(
+                    status_msg,
+                    f"🔍 *Query:* _{text[:80]}_\n\n"
+                    f"⚠️ Step 1/3: No strong matches — will use best available pages\n"
+                    f"🔄 Step 2/3: Loading pages → asking Gemini (`{GEMINI_MODEL}`)…\n"
+                    f"_LLM is reading your wiki and composing an answer_",
+                )
 
             async with typing_indicator(update.message.chat_id, update.message.get_bot()):
                 result = await asyncio.get_event_loop().run_in_executor(
@@ -1138,10 +1173,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "save_as": result.save_as,
                 "question": text,
             }
-            await status_msg.edit_text(
+            answer_msg = await status_msg.edit_text(
                 result.answer[:3800] + sources_text + save_hint,
                 parse_mode=ParseMode.MARKDOWN,
             )
+
+            # Track this message for emoji feedback
+            _query_answer_messages[answer_msg.message_id] = {
+                "question": text,
+                "answer": result.answer[:300],
+                "user_id": update.effective_user.id,
+            }
         except Exception as e:
             logger.exception("Query failed")
             await status_msg.edit_text(_format_user_error(e), parse_mode=ParseMode.MARKDOWN)
@@ -1236,6 +1278,50 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await do_ingest(update.message, content, "article", fname)
 
 
+# ── Emoji feedback handler ────────────────────────────────────────────────
+
+
+async def handle_emoji_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Detect when the user replies to a query answer with a positive emoji
+    (👍, 👌, ❤️, 🔥, 💯, 🙏) and log it as positive feedback.
+    """
+    if not is_allowed(update):
+        return
+
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+
+    # Check if this is a positive emoji
+    # Strip variation selectors and whitespace for comparison
+    clean = text.replace("\ufe0f", "").strip()
+    if clean not in _POSITIVE_EMOJI:
+        return
+
+    # Check if this is a reply to a tracked query answer message
+    reply = update.message.reply_to_message
+    if not reply:
+        return
+
+    query_data = _query_answer_messages.get(reply.message_id)
+    if not query_data:
+        return
+
+    # Log the positive feedback
+    logger.info(
+        "emoji feedback: user reacted with %r to query=%r",
+        text, query_data["question"][:60],
+    )
+    try:
+        wiki.append_feedback(query_data["question"], query_data["answer"])
+        await update.message.reply_text(
+            "✅ Thanks! I'll remember this was a good answer.",
+        )
+    except Exception as e:
+        logger.exception("Failed to save feedback")
+
+
 # ── Startup ───────────────────────────────────────────────────────────────────
 
 
@@ -1256,8 +1342,8 @@ def main() -> None:
     global llm, wiki, wiki_search
 
     llm = GeminiClient(api_key=GEMINI_API_KEY, model=GEMINI_MODEL)
-    wiki = WikiManager(data_dir=DATA_DIR, llm=llm)
     wiki_search = WikiSearch(wiki_dir=str(Path(DATA_DIR) / "wiki"))
+    wiki = WikiManager(data_dir=DATA_DIR, llm=llm, search=wiki_search)
 
     app = (
         Application.builder()
@@ -1282,9 +1368,14 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_view_page, pattern=r"^view:"))
     app.add_handler(CallbackQueryHandler(handle_link_category_callback, pattern=r"^linkcat:"))
 
-    # Message handlers
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    # Message handlers — emoji feedback must come before general text handler
+    # so that emoji replies to query answers are caught first
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.REPLY,
+        handle_emoji_feedback,
+    ), group=0)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text), group=1)
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document), group=1)
 
     logger.info("Starting bot (polling)…")
     app.run_polling(drop_pending_updates=True)

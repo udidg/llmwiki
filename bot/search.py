@@ -23,6 +23,12 @@ class SearchResult:
     score: float
 
 
+@dataclass
+class SearchResultWithContent(SearchResult):
+    """SearchResult that also carries the full page content for LLM context."""
+    content: str = ""  # full markdown content of the page
+
+
 def _extract_title(content: str, fallback: str) -> str:
     """Extract title from YAML frontmatter or first H1."""
     for line in content.splitlines():
@@ -90,8 +96,14 @@ class WikiSearch:
             self._bm25 = None
             logger.info("BM25 index empty (no wiki pages yet)")
 
-    def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
-        """Return top_k results for query, sorted by BM25 score descending."""
+    def search(self, query: str, top_k: int = 5, min_score: float = 0.0) -> list[SearchResult]:
+        """Return top_k results for query, sorted by BM25 score descending.
+
+        Args:
+            query: search query string
+            top_k: maximum number of results to return
+            min_score: minimum BM25 score threshold (results below this are excluded)
+        """
         if self._bm25 is None or not self._paths:
             return []
 
@@ -106,7 +118,7 @@ class WikiSearch:
 
         results: list[SearchResult] = []
         for idx, score in ranked:
-            if score <= 0:
+            if score <= 0 or score < min_score:
                 continue
             path = self._paths[idx]
             content = self._contents[idx]
@@ -119,4 +131,78 @@ class WikiSearch:
                     score=round(float(score), 3),
                 )
             )
+        return results
+
+    def search_with_content(
+        self, query: str, top_k: int = 8, min_score: float = 1.0, fallback_k: int = 3,
+    ) -> list[SearchResultWithContent]:
+        """Search and return full page content alongside scores.
+
+        Used by the query workflow to build LLM context with the most
+        relevant wiki pages.  If no results meet min_score, falls back
+        to the top fallback_k results regardless of score.
+
+        Args:
+            query: search query string
+            top_k: maximum number of results to return
+            min_score: minimum BM25 score threshold
+            fallback_k: if nothing meets min_score, return this many top results anyway
+        """
+        if self._bm25 is None or not self._paths:
+            return []
+
+        tokens = _tokenize(query)
+        if not tokens:
+            return []
+
+        scores = self._bm25.get_scores(tokens)
+        ranked = sorted(
+            enumerate(scores), key=lambda x: x[1], reverse=True
+        )
+
+        # First pass: collect results above min_score
+        results: list[SearchResultWithContent] = []
+        for idx, score in ranked[:top_k]:
+            if score <= 0 or score < min_score:
+                continue
+            path = self._paths[idx]
+            content = self._contents[idx]
+            title = _extract_title(content, fallback=Path(path).stem.replace("-", " ").title())
+            results.append(
+                SearchResultWithContent(
+                    path=path,
+                    title=title,
+                    snippet=_snippet(content),
+                    score=round(float(score), 3),
+                    content=content,
+                )
+            )
+
+        # Fallback: if nothing met the threshold, return top fallback_k anyway
+        if not results and fallback_k > 0:
+            logger.info(
+                "search_with_content: no results above min_score=%.1f — "
+                "falling back to top %d results",
+                min_score, fallback_k,
+            )
+            for idx, score in ranked[:fallback_k]:
+                if score <= 0:
+                    continue
+                path = self._paths[idx]
+                content = self._contents[idx]
+                title = _extract_title(content, fallback=Path(path).stem.replace("-", " ").title())
+                results.append(
+                    SearchResultWithContent(
+                        path=path,
+                        title=title,
+                        snippet=_snippet(content),
+                        score=round(float(score), 3),
+                        content=content,
+                    )
+                )
+
+        logger.info(
+            "search_with_content: query=%r → %d result(s) (top score=%.3f)",
+            query[:60], len(results), results[0].score if results else 0.0,
+        )
         return results
