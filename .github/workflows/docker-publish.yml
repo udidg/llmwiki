@@ -55,6 +55,9 @@ jobs:
             # Tag with short SHA for traceability
             type=sha,prefix=sha-,format=short
 
+      - name: Copy AGENTS.md into build context
+        run: cp data/AGENTS.md bot/AGENTS.md.bundled
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:

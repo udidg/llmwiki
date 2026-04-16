@@ -12,4 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# AGENTS.md is copied into the build context by CI (from data/AGENTS.md)
+# and will be synced to the data volume on startup by the app
+COPY AGENTS.md.bundled /app/AGENTS.md.bundled
+
 CMD ["python", "main.py"]

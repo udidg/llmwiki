@@ -19,6 +19,9 @@ data/raw/
 !data/.gitkeep
 !data/AGENTS.md
 
+# CI build artifacts
+bot/AGENTS.md.bundled
+
 # macOS
 .DS_Store
 

@@ -113,11 +113,23 @@ class WikiManager:
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
+    # Path where the Docker image bundles AGENTS.md (copied by CI)
+    _BUNDLED_AGENTS = Path("/app/AGENTS.md.bundled")
+
     def _ensure_dirs(self) -> None:
         for sub in ["articles", "journals", "podcasts", "assets"]:
             (self.raw / sub).mkdir(parents=True, exist_ok=True)
         for sub in ["sources", "people", "concepts", "insights"]:
             (self.wiki / sub).mkdir(parents=True, exist_ok=True)
+
+        # Sync bundled AGENTS.md to the data volume (always overwrite —
+        # AGENTS.md is code/config, not user data, so it should stay
+        # in sync with the deployed image version)
+        agents_dest = self.data / "AGENTS.md"
+        if self._BUNDLED_AGENTS.exists():
+            import shutil
+            shutil.copy2(self._BUNDLED_AGENTS, agents_dest)
+            logger.info("synced AGENTS.md from bundled image → %s", agents_dest)
 
         # Initialize index and log if missing
         index = self.wiki / "index.md"
