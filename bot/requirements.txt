@@ -6,3 +6,5 @@ python-dotenv
 rich
 PyYAML
 google-genai>=1.0
+duckduckgo-search>=7.0
+yt-dlp>=2024.0

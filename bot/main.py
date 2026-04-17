@@ -22,6 +22,7 @@ Natural language (no command needed):
   "Find articles about stoicism"      → web search
   "Fetch https://..."                 → URL fetch + ingest
   "I went for a run today..."         → journal ingest
+  Instagram URL                       → extract post, tag, categorize + ingest
   Any URL in message                  → auto-fetch + ingest
   .md / .txt file                     → ingest
 """
@@ -51,7 +52,14 @@ from telegram.ext import (
     filters,
 )
 
-from fetcher import FetchResult, fetch_url, web_search
+from fetcher import (
+    FetchResult,
+    InstagramPost,
+    extract_instagram_post,
+    fetch_url,
+    is_instagram_url,
+    web_search,
+)
 from gemini import GeminiClient
 from search import WikiSearch
 from wiki import WikiManager, now_slug, slugify
@@ -888,8 +896,126 @@ def _classify_link(url: str, content: str, title: str) -> dict:
     return {"category": "ambiguous", "description": title or "Link", "confidence": 0.0}
 
 
+def _classify_instagram_post(post: InstagramPost) -> dict:
+    """
+    Use the LLM to generate tags, description, and category for an Instagram post.
+    Returns a dict with keys: tags, description, category, confidence.
+    """
+    logger.info("  → LLM Instagram classification for: @%s post %s", post.author, post.url[:60])
+    system = (
+        "You are a content tagger for a personal knowledge base. "
+        "Given an Instagram post, generate:\n"
+        "- tags: a list of 3-7 relevant tags for this content (lowercase, no #)\n"
+        "- description: A one-sentence description of what this post is about\n"
+        "- category: one of to_buy, to_review, to_read\n"
+        "  - to_buy: products, items, shopping recommendations, deals\n"
+        "  - to_review: tools, apps, services, places, restaurants to try\n"
+        "  - to_read: educational content, articles, tutorials, inspiration, motivation\n"
+        "- confidence: 0.0-1.0\n\n"
+        "Reply with ONLY a JSON object (no markdown fences):\n"
+        '{"tags": ["tag1", "tag2"], "description": "...", '
+        '"category": "to_buy|to_review|to_read|ambiguous", "confidence": 0.9}'
+    )
+
+    # Build context from the post
+    parts = [f"Instagram Post URL: {post.url}"]
+    if post.author:
+        parts.append(f"Author: @{post.author}")
+    if post.caption:
+        # Truncate very long captions
+        caption = post.caption[:2000] if len(post.caption) > 2000 else post.caption
+        parts.append(f"Caption:\n{caption}")
+    if post.hashtags:
+        parts.append(f"Hashtags: {', '.join('#' + h for h in post.hashtags)}")
+    if post.is_video:
+        parts.append("Type: Video/Reel")
+    else:
+        parts.append("Type: Photo")
+    if post.like_count is not None:
+        parts.append(f"Likes: {post.like_count}")
+    if post.comment_count is not None:
+        parts.append(f"Comments: {post.comment_count}")
+
+    user_msg = "\n".join(parts)
+    messages = [{"role": "user", "content": user_msg}]
+    response = llm.chat(system, messages).strip()
+    logger.info("  ← LLM Instagram classification response: %r", response[:200])
+
+    from gemini import extract_json as _extract_json
+    data = _extract_json(response)
+    if data and "category" in data:
+        # Ensure tags is a list
+        if "tags" not in data or not isinstance(data["tags"], list):
+            data["tags"] = post.hashtags or []
+        return data
+
+    # Fallback
+    logger.warning("  LLM returned unexpected Instagram classification — defaulting to ambiguous")
+    return {
+        "tags": post.hashtags or [],
+        "description": post.caption[:100] if post.caption else "Instagram post",
+        "category": "ambiguous",
+        "confidence": 0.0,
+    }
+
+
+def _build_instagram_content(post: InstagramPost, classification: dict) -> str:
+    """Build enriched markdown content for an Instagram post to be ingested."""
+    tags = classification.get("tags", post.hashtags or [])
+    description = classification.get("description", "")
+    category = classification.get("category", "")
+    label = _CATEGORY_LABEL.get(category, category)
+
+    lines = [
+        "---",
+        f"url: {post.url}",
+        f"title: Instagram Post by @{post.author}" if post.author else "title: Instagram Post",
+        "source_type: instagram",
+        f"author: \"@{post.author}\"" if post.author else "author: unknown",
+        f"date_ingested: {datetime.now().strftime('%Y-%m-%d')}",
+    ]
+    if post.timestamp:
+        lines.append(f"date_posted: {post.timestamp}")
+    if tags:
+        lines.append(f"tags: [{', '.join(tags)}]")
+    if label:
+        lines.append(f"action_list: {label}")
+    if description:
+        lines.append(f"description: \"{description}\"")
+    if post.thumbnail_url:
+        lines.append(f"thumbnail: {post.thumbnail_url}")
+    lines.append("---")
+    lines.append("")
+
+    if post.caption:
+        lines.append("## Caption")
+        lines.append("")
+        lines.append(post.caption)
+        lines.append("")
+
+    lines.append("## Metadata")
+    lines.append("")
+    if post.author:
+        lines.append(f"- Author: @{post.author}")
+    if post.timestamp:
+        lines.append(f"- Posted: {post.timestamp}")
+    if post.like_count is not None:
+        lines.append(f"- Likes: {post.like_count:,}")
+    if post.comment_count is not None:
+        lines.append(f"- Comments: {post.comment_count:,}")
+    lines.append(f"- Type: {'Video/Reel' if post.is_video else 'Photo'}")
+    if post.hashtags:
+        lines.append(f"- Hashtags: {', '.join('#' + h for h in post.hashtags)}")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
 # Per-user state: pending link categorization for inline keyboard
 _pending_links: dict[int, dict] = {}
+
+# Per-user state: pending Instagram post for inline keyboard
+_pending_instagram: dict[int, dict] = {}
 
 _CATEGORY_EMOJI = {
     "to_buy": "🛒",
@@ -956,11 +1082,59 @@ async def handle_link_category_callback(update: Update, context: ContextTypes.DE
     await do_ingest(query.message, enriched_content, "article", filename)
 
 
+async def handle_instagram_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline keyboard button presses for Instagram post categorization."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data or ""
+    if not data.startswith("igcat:"):
+        return
+
+    category = data[len("igcat:"):]
+    user_id = update.effective_user.id
+    pending = _pending_instagram.pop(user_id, None)
+
+    if not pending:
+        await query.message.reply_text("⚠️ Instagram data expired. Please send the link again.")
+        return
+
+    post: InstagramPost = pending["post"]
+    classification: dict = pending["classification"]
+
+    # Override category with user's choice
+    classification["category"] = category
+
+    emoji = _CATEGORY_EMOJI.get(category, "📋")
+    label = _CATEGORY_LABEL.get(category, category)
+    description = classification.get("description", post.caption[:80] if post.caption else "Instagram post")
+    tags = classification.get("tags", post.hashtags or [])
+
+    # Update the message to show the chosen category
+    await query.message.edit_text(
+        f"📸 *Instagram post categorized:* {emoji} {label}\n\n"
+        f"*Author:* @{post.author}\n"
+        f"*Description:* _{description}_\n"
+        f"🏷️ Tags: {', '.join(tags) if tags else '(none)'}\n\n"
+        f"🔄 Ingesting into wiki…",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    # Build enriched content and ingest
+    enriched_content = _build_instagram_content(post, classification)
+    slug = slugify(f"instagram-{post.author}-{now_slug()}" if post.author else f"instagram-{now_slug()}")
+    filename = f"{slug}.md"
+
+    wiki.save_raw(enriched_content, "articles", filename)
+    await do_ingest(query.message, enriched_content, "instagram", filename)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle plain text messages with smart intent detection.
     No command required — the bot figures out what you mean:
 
+      Instagram URL           → extract post, tag, categorize + ingest
       URL in message          → smart link categorization + ingest
       "What did I learn..."   → query wiki
       "Search online for..."  → web search
@@ -973,10 +1147,115 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not text:
         return
 
-    # ── 1. URL detection (highest priority) — smart link categorization ───────
+    # ── 1. URL detection (highest priority) ───────────────────────────────────
     url_match = URL_RE.search(text)
     if url_match:
         url = url_match.group(0)
+
+        # ── 1a. Instagram URL — special handling ──────────────────────────────
+        if is_instagram_url(url):
+            status_msg = await update.message.reply_text(
+                f"📸 *Instagram Post Detected*\n"
+                f"_Extracting post data…_\n\n"
+                f"🔄 Step 1/3: Extracting metadata via yt-dlp…",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            try:
+                async with typing_indicator(update.message.chat_id, update.message.get_bot()):
+                    post = await extract_instagram_post(url)
+
+                if not post:
+                    await status_msg.edit_text(
+                        f"📸 *Instagram Post*\n\n"
+                        f"❌ Could not extract post data.\n"
+                        f"The post may be private or Instagram may be blocking access.\n\n"
+                        f"_Try sending a public post URL._",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    return
+
+                caption_preview = (post.caption[:100] + "…") if post.caption and len(post.caption) > 100 else (post.caption or "(no caption)")
+
+                await _update_status(
+                    status_msg,
+                    f"📸 *Instagram Post Detected*\n\n"
+                    f"✅ Step 1/3: Extracted — @{post.author or 'unknown'}\n"
+                    f"📝 _{caption_preview}_\n"
+                    f"🔄 Step 2/3: Generating tags & categorizing…\n"
+                    f"_LLM is analyzing the post content_",
+                )
+
+                # Classify the Instagram post using LLM
+                async with typing_indicator(update.message.chat_id, update.message.get_bot()):
+                    classification = await asyncio.get_event_loop().run_in_executor(
+                        None, _classify_instagram_post, post
+                    )
+
+                category = classification.get("category", "ambiguous")
+                description = classification.get("description", caption_preview)
+                confidence = classification.get("confidence", 0.0)
+                tags = classification.get("tags", post.hashtags or [])
+
+                logger.info(
+                    "instagram classified: url=%s category=%s confidence=%.2f tags=%s",
+                    url[:60], category, confidence, tags[:5],
+                )
+
+                if category == "ambiguous" or confidence < 0.6:
+                    # Ambiguous — ask the user via inline keyboard
+                    _pending_instagram[update.effective_user.id] = {
+                        "post": post,
+                        "classification": classification,
+                    }
+
+                    buttons = [
+                        [InlineKeyboardButton("🛒 To Buy", callback_data="igcat:to_buy")],
+                        [InlineKeyboardButton("🔍 To Review", callback_data="igcat:to_review")],
+                        [InlineKeyboardButton("📖 To Read", callback_data="igcat:to_read")],
+                    ]
+                    reply_markup = InlineKeyboardMarkup(buttons)
+
+                    await status_msg.edit_text(
+                        f"📸 *Instagram Post by @{post.author or 'unknown'}*\n\n"
+                        f"📝 _{description}_\n"
+                        f"🏷️ Tags: {', '.join(tags) if tags else '(none)'}\n\n"
+                        f"🤔 I'm not sure which list this belongs to.\n"
+                        f"*Which reading list should I add it to?*",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=reply_markup,
+                    )
+                else:
+                    # Confident classification — auto-categorize and ingest
+                    emoji = _CATEGORY_EMOJI.get(category, "📋")
+                    label = _CATEGORY_LABEL.get(category, category)
+
+                    await _update_status(
+                        status_msg,
+                        f"📸 *Instagram Post Detected*\n\n"
+                        f"✅ Step 1/3: Extracted — @{post.author or 'unknown'}\n"
+                        f"✅ Step 2/3: Categorized → {emoji} {label}\n"
+                        f"📝 _{description}_\n"
+                        f"🏷️ Tags: {', '.join(tags)}\n\n"
+                        f"🔄 Step 3/3: Ingesting into wiki…",
+                    )
+
+                    enriched_content = _build_instagram_content(post, classification)
+                    slug = slugify(
+                        f"instagram-{post.author}-{now_slug()}"
+                        if post.author
+                        else f"instagram-{now_slug()}"
+                    )
+                    filename = f"{slug}.md"
+
+                    wiki.save_raw(enriched_content, "articles", filename)
+                    await do_ingest(update.message, enriched_content, "instagram", filename)
+
+            except Exception as e:
+                logger.exception("Instagram processing failed")
+                await status_msg.edit_text(_format_user_error(e), parse_mode=ParseMode.MARKDOWN)
+            return
+
+        # ── 1b. Generic URL — smart link categorization ───────────────────────
         status_msg = await update.message.reply_text(
             f"🔗 *Smart Link Processing*\n"
             f"_Detected URL in message_\n\n"
@@ -1345,6 +1624,7 @@ def main() -> None:
     # Callback query handlers (inline keyboard buttons)
     app.add_handler(CallbackQueryHandler(handle_view_page, pattern=r"^view:"))
     app.add_handler(CallbackQueryHandler(handle_link_category_callback, pattern=r"^linkcat:"))
+    app.add_handler(CallbackQueryHandler(handle_instagram_category_callback, pattern=r"^igcat:"))
 
     # Message handlers — emoji feedback must come before general text handler
     # so that emoji replies to query answers are caught first

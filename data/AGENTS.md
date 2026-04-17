@@ -300,6 +300,56 @@ When the user shares web search results and asks you to analyze or ingest them:
 
 ---
 
+## Instagram Post Workflow
+
+When the user shares an Instagram post URL (instagram.com/p/, /reel/, /tv/):
+
+1. The bot extracts the post metadata automatically (caption, author, thumbnail, hashtags, likes, comments).
+2. Treat it as an ingest with `source_type: instagram`.
+3. Include Instagram-specific frontmatter fields:
+   - `author`: the Instagram username
+   - `thumbnail`: URL to the post image
+   - `date_posted`: when the post was published
+   - `tags`: generated from hashtags + LLM analysis
+   - `action_list`: which reading list it belongs to (To Buy / To Review / To Read)
+4. The source page format for Instagram posts:
+
+```
+---
+title: Instagram Post by @username
+source_type: instagram
+source_url: https://instagram.com/p/ABC123
+author: "@username"
+date_ingested: YYYY-MM-DD
+date_posted: YYYY-MM-DD
+tags: [tag1, tag2, tag3]
+action_list: To Read
+description: "One-sentence description"
+thumbnail: https://...
+---
+
+## Caption
+
+The original Instagram caption text...
+
+## Metadata
+
+- Author: @username
+- Posted: YYYY-MM-DD
+- Likes: 1,234
+- Comments: 56
+- Type: Photo/Video/Reel
+- Hashtags: #tag1, #tag2
+```
+
+5. Follow the standard Ingest Workflow for wiki page creation (create concept pages, update index, append log).
+6. When categorizing Instagram posts into action lists:
+   - **To Buy**: products, items, shopping recommendations, deals, wishlists
+   - **To Review**: tools, apps, services, places, restaurants to try
+   - **To Read**: educational content, tutorials, inspiration, motivation, informational posts
+
+---
+
 ## Feedback & Learning
 
 The bot tracks which answers the user liked (via emoji reactions like 👍, 👌, ❤️, 🔥).
