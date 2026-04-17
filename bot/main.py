@@ -266,69 +266,44 @@ async def do_ingest(
     source_type: str,
     filename: str,
 ) -> None:
-    """Run ingest and reply with a formatted summary showing each step."""
+    """Run ingest and reply with a concise summary."""
     await message.chat.send_action(ChatAction.TYPING)
-    word_count = len(content.split())
 
-    # Step 1: Starting
     status_msg = await message.reply_text(
-        f"⏳ *Ingesting* `{filename}`\n"
-        f"📊 Source: {source_type} • {word_count} words\n\n"
-        f"🔄 Step 1/4: Assembling context (index + log)…",
+        f"⏳ Ingesting `{filename}`…",
         parse_mode=ParseMode.MARKDOWN,
     )
 
     try:
-        # Step 2: Sending to LLM
-        await _update_status(
-            status_msg,
-            f"⏳ *Ingesting* `{filename}`\n"
-            f"📊 Source: {source_type} • {word_count} words\n\n"
-            f"✅ Step 1/4: Context assembled\n"
-            f"🔄 Step 2/4: Sending to Gemini (`{GEMINI_MODEL}`)…\n"
-            f"_LLM is reading the source and deciding what wiki pages to create/update_",
-        )
-
         async with typing_indicator(message.chat_id, message.get_bot()):
             result = await asyncio.get_event_loop().run_in_executor(
                 None, wiki.ingest, content, source_type, filename
             )
 
-        # Step 3: File writes done
-        created_list = "\n".join(f"  📄 `{p}`" for p in result.created) or "  (none)"
-        updated_list = "\n".join(f"  ✏️ `{p}`" for p in result.updated) or "  (none)"
-
-        await _update_status(
-            status_msg,
-            f"⏳ *Ingesting* `{filename}`\n"
-            f"📊 Source: {source_type} • {word_count} words\n\n"
-            f"✅ Step 1/4: Context assembled\n"
-            f"✅ Step 2/4: Gemini processed\n"
-            f"✅ Step 3/4: Files written\n"
-            f"🔄 Step 4/4: Rebuilding search index…",
-        )
-
         wiki_search.rebuild_index()
 
-        # Step 4: Done — build inline keyboard for viewing created/updated files
+        # Build inline keyboard for viewing created/updated files
         all_paths = result.created + result.updated
         buttons = []
         for p in all_paths:
-            # Skip index.md and log.md — they're bookkeeping, not interesting
             if p.endswith(("index.md", "log.md")):
                 continue
-            label = p.replace("wiki/", "", 1)  # shorter label
+            label = p.replace("wiki/", "", 1)
             buttons.append([InlineKeyboardButton(f"📖 {label}", callback_data=f"view:{p}")])
 
         reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
 
-        reply = (
-            f"✅ *Ingested:* {result.title}\n\n"
-            f"*Created:*\n{created_list}\n\n"
-            f"*Updated:*\n{updated_list}\n\n"
-            f"_{result.summary}_"
+        created_list = ", ".join(f"`{p}`" for p in result.created) or "(none)"
+        updated_list = ", ".join(f"`{p}`" for p in result.updated) or "(none)"
+
+        await status_msg.edit_text(
+            f"✅ *{result.title}*\n\n"
+            f"📄 Created: {created_list}\n"
+            f"✏️ Updated: {updated_list}\n\n"
+            f"_{result.summary}_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=reply_markup,
         )
-        await status_msg.edit_text(reply, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
     except Exception as e:
         logger.exception("Ingest failed")
         await status_msg.edit_text(_format_user_error(e), parse_mode=ParseMode.MARKDOWN)
@@ -445,23 +420,12 @@ async def cmd_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.chat.send_action(ChatAction.TYPING)
 
-    # Verbose: show query expansion + BM25 search steps
     status_msg = await update.message.reply_text(
-        f"🔍 *Query:* _{question}_\n\n"
-        f"🔄 Step 1/2: Expanding query + BM25 searching wiki…\n"
-        f"_LLM generates alternative search terms, then BM25 finds relevant pages_",
+        f"🔍 _{question[:80]}_\n\nThinking…",
         parse_mode=ParseMode.MARKDOWN,
     )
 
     try:
-        await _update_status(
-            status_msg,
-            f"🔍 *Query:* _{question}_\n\n"
-            f"✅ Step 1/2: Query expanded + pages found\n"
-            f"🔄 Step 2/2: Loading pages → asking Gemini (`{GEMINI_MODEL}`)…\n"
-            f"_LLM is reading your wiki and composing an answer_",
-        )
-
         async with typing_indicator(update.message.chat_id, update.message.get_bot()):
             result = await asyncio.get_event_loop().run_in_executor(
                 None, wiki.query, question
@@ -541,8 +505,7 @@ async def cmd_websearch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     status_msg = await update.message.reply_text(
-        f"🌐 *Web search:* `{query}`\n\n"
-        f"🔄 Querying DuckDuckGo (no API key, HTML scrape)…",
+        f"🌐 *Web search:* `{query}`\n\nSearching…",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -551,9 +514,7 @@ async def cmd_websearch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             results = await web_search(query, max_results=5)
         if not results:
             await status_msg.edit_text(
-                f"🌐 *Web search:* `{query}`\n\n"
-                f"🔍 No results found.\n"
-                f"_DuckDuckGo returned no matching pages._",
+                f"🌐 *Web search:* `{query}`\n\nNo results found.",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
@@ -584,8 +545,7 @@ async def cmd_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     status_msg = await update.message.reply_text(
-        f"🌐 *Fetching URL*\n`{url}`\n\n"
-        f"🔄 Step 1/3: Downloading page…",
+        f"📥 Fetching `{url}`…",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -593,23 +553,11 @@ async def cmd_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         async with typing_indicator(update.message.chat_id, update.message.get_bot()):
             fetch_result: FetchResult = await fetch_url(url)
 
-        await _update_status(
-            status_msg,
-            f"🌐 *Fetching URL*\n`{url}`\n\n"
-            f"✅ Step 1/3: Downloaded — *{fetch_result.title}*\n"
-            f"📝 {fetch_result.word_count} words extracted\n"
-            f"🔄 Step 2/3: Saving raw content…",
-        )
-
-        # Save raw and ingest
         wiki.save_raw(fetch_result.content, "articles", fetch_result.filename)
 
         await _update_status(
             status_msg,
-            f"🌐 *Fetching URL*\n`{url}`\n\n"
-            f"✅ Step 1/3: Downloaded — *{fetch_result.title}*\n"
-            f"✅ Step 2/3: Raw saved as `{fetch_result.filename}`\n"
-            f"🔄 Step 3/3: Ingesting into wiki…",
+            f"📥 Fetched *{fetch_result.title}* ({fetch_result.word_count} words)\n\nIngesting…",
         )
 
         await do_ingest(update.message, fetch_result.content, "article", fetch_result.filename)
@@ -623,22 +571,12 @@ async def cmd_lint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return await deny(update)
 
-    page_count = len(wiki.list_pages())
     status_msg = await update.message.reply_text(
-        f"🔍 *Wiki Health Check*\n\n"
-        f"🔄 Step 1/2: Loading all {page_count} wiki page(s)…",
+        "🔍 Checking wiki health…",
         parse_mode=ParseMode.MARKDOWN,
     )
 
     try:
-        await _update_status(
-            status_msg,
-            f"🔍 *Wiki Health Check*\n\n"
-            f"✅ Step 1/2: Loaded {page_count} page(s)\n"
-            f"🔄 Step 2/2: Asking Gemini (`{GEMINI_MODEL}`) to analyze…\n"
-            f"_LLM is checking for contradictions, orphans, missing concepts, stale content_",
-        )
-
         async with typing_indicator(update.message.chat_id, update.message.get_bot()):
             result = await asyncio.get_event_loop().run_in_executor(None, wiki.lint)
 
@@ -1155,9 +1093,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # ── 1a. Instagram URL — special handling ──────────────────────────────
         if is_instagram_url(url):
             status_msg = await update.message.reply_text(
-                f"📸 *Instagram Post Detected*\n"
-                f"_Extracting post data…_\n\n"
-                f"🔄 Step 1/3: Extracting metadata via yt-dlp…",
+                "📸 Processing Instagram post…",
                 parse_mode=ParseMode.MARKDOWN,
             )
             try:
@@ -1166,24 +1102,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
                 if not post:
                     await status_msg.edit_text(
-                        f"📸 *Instagram Post*\n\n"
-                        f"❌ Could not extract post data.\n"
-                        f"The post may be private or Instagram may be blocking access.\n\n"
-                        f"_Try sending a public post URL._",
+                        "📸 ❌ Could not extract post data — it may be private.",
                         parse_mode=ParseMode.MARKDOWN,
                     )
                     return
 
                 caption_preview = (post.caption[:100] + "…") if post.caption and len(post.caption) > 100 else (post.caption or "(no caption)")
-
-                await _update_status(
-                    status_msg,
-                    f"📸 *Instagram Post Detected*\n\n"
-                    f"✅ Step 1/3: Extracted — @{post.author or 'unknown'}\n"
-                    f"📝 _{caption_preview}_\n"
-                    f"🔄 Step 2/3: Generating tags & categorizing…\n"
-                    f"_LLM is analyzing the post content_",
-                )
 
                 # Classify the Instagram post using LLM
                 async with typing_indicator(update.message.chat_id, update.message.get_bot()):
@@ -1216,11 +1140,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     reply_markup = InlineKeyboardMarkup(buttons)
 
                     await status_msg.edit_text(
-                        f"📸 *Instagram Post by @{post.author or 'unknown'}*\n\n"
-                        f"📝 _{description}_\n"
-                        f"🏷️ Tags: {', '.join(tags) if tags else '(none)'}\n\n"
-                        f"🤔 I'm not sure which list this belongs to.\n"
-                        f"*Which reading list should I add it to?*",
+                        f"📸 *@{post.author or 'unknown'}*\n\n"
+                        f"_{description}_\n"
+                        f"🏷️ {', '.join(tags) if tags else ''}\n\n"
+                        f"Which list?",
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=reply_markup,
                     )
@@ -1231,12 +1154,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
                     await _update_status(
                         status_msg,
-                        f"📸 *Instagram Post Detected*\n\n"
-                        f"✅ Step 1/3: Extracted — @{post.author or 'unknown'}\n"
-                        f"✅ Step 2/3: Categorized → {emoji} {label}\n"
-                        f"📝 _{description}_\n"
-                        f"🏷️ Tags: {', '.join(tags)}\n\n"
-                        f"🔄 Step 3/3: Ingesting into wiki…",
+                        f"📸 @{post.author or 'unknown'} → {emoji} {label}\n\nIngesting…",
                     )
 
                     enriched_content = _build_instagram_content(post, classification)
@@ -1257,22 +1175,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         # ── 1b. Generic URL — smart link categorization ───────────────────────
         status_msg = await update.message.reply_text(
-            f"🔗 *Smart Link Processing*\n"
-            f"_Detected URL in message_\n\n"
-            f"🔄 Step 1/3: Fetching `{url}`…",
+            f"🔗 Processing link…",
             parse_mode=ParseMode.MARKDOWN,
         )
         try:
             async with typing_indicator(update.message.chat_id, update.message.get_bot()):
                 fetch_result = await fetch_url(url)
-
-            await _update_status(
-                status_msg,
-                f"🔗 *Smart Link Processing*\n\n"
-                f"✅ Step 1/3: Fetched — *{fetch_result.title}* ({fetch_result.word_count} words)\n"
-                f"🔄 Step 2/3: Analyzing content & categorizing…\n"
-                f"_LLM is reading the page and deciding which action list it belongs to_",
-            )
 
             # Classify the link using LLM
             async with typing_indicator(update.message.chat_id, update.message.get_bot()):
@@ -1307,10 +1215,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 reply_markup = InlineKeyboardMarkup(buttons)
 
                 await status_msg.edit_text(
-                    f"🔗 *Link fetched:* *{fetch_result.title}*\n\n"
-                    f"📝 _{description}_\n\n"
-                    f"🤔 I'm not sure which list this belongs to.\n"
-                    f"*Which action list should I add it to?*",
+                    f"🔗 *{fetch_result.title}*\n\n"
+                    f"_{description}_\n\n"
+                    f"Which list?",
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=reply_markup,
                 )
@@ -1321,11 +1228,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
                 await _update_status(
                     status_msg,
-                    f"🔗 *Smart Link Processing*\n\n"
-                    f"✅ Step 1/3: Fetched — *{fetch_result.title}*\n"
-                    f"✅ Step 2/3: Categorized → {emoji} {label}\n"
-                    f"📝 _{description}_\n\n"
-                    f"🔄 Step 3/3: Saving raw + ingesting into wiki…",
+                    f"🔗 *{fetch_result.title}* → {emoji} {label}\n\nIngesting…",
                 )
 
                 wiki.save_raw(fetch_result.content, "articles", fetch_result.filename)
@@ -1353,48 +1256,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     intent = _classify_intent_fast(text)
 
     if intent:
-        # Show the fast classification result
-        emoji = _INTENT_EMOJI.get(intent, "🤖")
-        label = _INTENT_LABEL.get(intent, intent)
-        thinking = await update.message.reply_text(
-            f"🧠 *Intent:* {emoji} {label}\n"
-            f"_Classified via fast regex pattern match (no LLM needed)_",
-            parse_mode=ParseMode.MARKDOWN,
-        )
         logger.info("intent classified (fast regex): %r → %s", text[:60], intent)
-        # Delete the thinking message after a short delay
-        await asyncio.sleep(1.5)
-        try:
-            await thinking.delete()
-        except Exception:
-            pass
     else:
         # ── 3. LLM classification for ambiguous messages ──────────────────────
-        thinking = await update.message.reply_text(
-            f"🧠 *Classifying intent…*\n"
-            f"_Message is ambiguous — asking Gemini (`{GEMINI_MODEL}`) to classify_\n\n"
-            f"🔄 Sending to LLM intent classifier…",
-            parse_mode=ParseMode.MARKDOWN,
-        )
         logger.info("intent ambiguous — using LLM classifier for: %r", text[:60])
 
         async with typing_indicator(update.message.chat_id, update.message.get_bot()):
             intent = await asyncio.get_event_loop().run_in_executor(
                 None, _classify_intent_llm, text
             )
-
-        emoji = _INTENT_EMOJI.get(intent, "🤖")
-        label = _INTENT_LABEL.get(intent, intent)
-        await _update_status(
-            thinking,
-            f"🧠 *Intent:* {emoji} {label}\n"
-            f"_Classified by Gemini LLM (message was ambiguous for regex)_",
-        )
-        await asyncio.sleep(1.5)
-        try:
-            await thinking.delete()
-        except Exception:
-            pass
+        logger.info("intent classified (LLM): %r → %s", text[:60], intent)
 
     # ── 4. Route to the right handler ────────────────────────────────────────
     if intent == "query":
@@ -1402,21 +1273,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.chat.send_action(ChatAction.TYPING)
 
         status_msg = await update.message.reply_text(
-            f"🔍 *Query:* _{text[:80]}_\n\n"
-            f"🔄 Step 1/2: Expanding query + BM25 searching wiki…\n"
-            f"_LLM generates alternative search terms, then BM25 finds relevant pages_",
+            f"🔍 _{text[:80]}_\n\nThinking…",
             parse_mode=ParseMode.MARKDOWN,
         )
 
         try:
-            await _update_status(
-                status_msg,
-                f"🔍 *Query:* _{text[:80]}_\n\n"
-                f"✅ Step 1/2: Query expanded + pages found\n"
-                f"🔄 Step 2/2: Loading pages → asking Gemini (`{GEMINI_MODEL}`)…\n"
-                f"_LLM is reading your wiki and composing an answer_",
-            )
-
             async with typing_indicator(update.message.chat_id, update.message.get_bot()):
                 result = await asyncio.get_event_loop().run_in_executor(
                     None, wiki.query, text
@@ -1456,8 +1317,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         ).strip() or text
 
         status_msg = await update.message.reply_text(
-            f"🌐 *Web search:* `{query}`\n\n"
-            f"🔄 Querying DuckDuckGo…",
+            f"🌐 *Web search:* `{query}`\n\nSearching…",
             parse_mode=ParseMode.MARKDOWN,
         )
         try:
@@ -1503,35 +1363,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    status_msg = await update.message.reply_text(
-        f"📥 *File upload:* `{fname}`\n\n"
-        f"🔄 Step 1/3: Downloading from Telegram…",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
         tg_file = await doc.get_file()
         await tg_file.download_to_drive(tmp.name)
         content = Path(tmp.name).read_text(encoding="utf-8", errors="replace")
 
-    word_count = len(content.split())
-    await _update_status(
-        status_msg,
-        f"📥 *File upload:* `{fname}`\n\n"
-        f"✅ Step 1/3: Downloaded ({word_count} words)\n"
-        f"🔄 Step 2/3: Saving raw content…",
-    )
-
     wiki.save_raw(content, "articles", fname)
-
-    await _update_status(
-        status_msg,
-        f"📥 *File upload:* `{fname}`\n\n"
-        f"✅ Step 1/3: Downloaded ({word_count} words)\n"
-        f"✅ Step 2/3: Raw saved\n"
-        f"🔄 Step 3/3: Ingesting into wiki…",
-    )
-
     await do_ingest(update.message, content, "article", fname)
 
 

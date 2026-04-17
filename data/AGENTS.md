@@ -353,6 +353,10 @@ The original Instagram caption text...
 ## Feedback & Learning
 
 The bot tracks which answers the user liked (via emoji reactions like 👍, 👌, ❤️, 🔥).
+Positively-rated Q&A pairs are stored in `feedback.md` (at the data root, alongside
+this file). This file is maintained by the bot at runtime and is **not** part of the
+codebase — do not commit it to git.
+
 When available, recent positively-rated Q&A pairs are included in the query prompt
 under "Examples of Answers the User Liked".
 

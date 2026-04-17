@@ -149,9 +149,24 @@ class WikiManager:
                 "Format: `## [YYYY-MM-DD] <operation> | <title>`\n\n---\n"
             )
 
-        feedback = self.wiki / "feedback.md"
-        if not feedback.exists():
-            feedback.write_text(
+        # Migrate feedback.md from old location (wiki/) to new location (data root)
+        old_feedback = self.wiki / "feedback.md"
+        new_feedback = self.data / "feedback.md"
+        if old_feedback.exists() and not new_feedback.exists():
+            import shutil as _shutil
+            _shutil.move(str(old_feedback), str(new_feedback))
+            logger.info("migrated feedback.md from wiki/ to data root")
+        elif old_feedback.exists() and new_feedback.exists():
+            # Merge: append old content to new, then remove old
+            old_content = old_feedback.read_text(encoding="utf-8")
+            with new_feedback.open("a", encoding="utf-8") as f:
+                f.write("\n" + old_content)
+            old_feedback.unlink()
+            logger.info("merged old wiki/feedback.md into data/feedback.md")
+
+        # Initialize feedback file at data root if missing
+        if not new_feedback.exists():
+            new_feedback.write_text(
                 "# Query Feedback\n\n"
                 "Positively-rated Q&A pairs (user reacted with 👍/👌/❤️/🔥).\n"
                 "The LLM uses these as examples of good answers.\n\n---\n"
@@ -217,7 +232,7 @@ class WikiManager:
 
     def append_feedback(self, question: str, answer_snippet: str) -> None:
         """Append a positively-rated Q&A pair to the feedback log."""
-        feedback = self.wiki / "feedback.md"
+        feedback = self.data / "feedback.md"
         snippet = answer_snippet[:300].replace("\n", " ").strip()
         entry = (
             f"\n## [{today()}] ✅ Good answer\n"
@@ -230,7 +245,7 @@ class WikiManager:
 
     def _load_recent_feedback(self, n: int = 5) -> str:
         """Load the last n positively-rated Q&A pairs for LLM context."""
-        feedback = self.wiki / "feedback.md"
+        feedback = self.data / "feedback.md"
         if not feedback.exists():
             return ""
         content = feedback.read_text(encoding="utf-8")

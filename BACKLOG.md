@@ -7,6 +7,6 @@
 - [x] **Smart link categorization** — when a user sends a link, fetch its content, generate a description, and add it to a relevant action list (To Buy / To Review / To Read) based on the content. If the intent is ambiguous, ask the user which list to add it to via inline keyboard buttons.
 - [x] **Fix web search** — replaced broken DuckDuckGo HTML scraping with the `duckduckgo-search` Python library for reliable results.
 - [x] **Instagram post support** — when a user sends an Instagram post/reel URL, extract metadata via yt-dlp (caption, author, thumbnail, hashtags), generate tags and description via LLM, and assign to a reading list (To Buy / To Review / To Read).
-- [] Add a watch tower for changes - that pull changes every 30 min. check for docker-compose update pull the docker-compose and apply it.
-- [] Make the bot messages a bit more clearly formatted, a bit less verbose but keep important messages (like it is thinking, errors etc) 
-- [] Reactions, good and bad responses that improve the LLMshould be added to a separate file as it is edited by the bot itself and not committed to git. AGENTS.md is part of the code base and should reference the file. 
+- [x] **Watchtower auto-updater** — added Watchtower container to `docker-compose.yml` that polls GHCR every 30 minutes for new bot images and auto-restarts. Uses label-based filtering to only watch the bot container.
+- [x] **Cleaner bot messages** — simplified all status messages: removed multi-step progress updates, removed intent classification display messages, kept typing indicators and error messages. Messages are now concise single-line status → final result.
+- [x] **Feedback file separation** — moved `feedback.md` from `wiki/` to the data root (`data/feedback.md`), outside the git-tracked wiki directory. AGENTS.md now references the file location. Includes automatic migration of existing feedback data.
